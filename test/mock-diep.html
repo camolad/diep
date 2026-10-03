@@ -38,6 +38,9 @@
  *                 round=poly                circles are drawn as 32-sided polygons (style=real only)
  *                 drones=4                  every enemy keeps this many triangular drones orbiting it
  *                 score=3000                my score (default: the middle of my level's range)
+ *                 mode=sandbox|ffa          window.__common__.active_gamemode, the way the real client reports the game mode
+ *                 mouse=trusted|pointer     only real (trusted) mouse events steer the barrel / only pointermove events do (synthetic mousemove ignored)
+ *                 api=1                     window.input.mouse(x, y) steers the barrel (canvas px)
  * Enemies (addEnemy spec): name, level, score, hp, pattern, shoot, dodge:{bias,fav,react,speed}, half (periodic half-period, s)
  * Drawn like the real client is assumed to: name above each tank (fillText), health bar below a damaged tank (round-capped stroke,
  * #555555 back + #85e37d fill), leaderboard rows "Name - 12.3k" on the right (fillText), own "Score: 1.2k" and "Lvl N Tank" at the bottom.
@@ -66,6 +69,9 @@
     zoomanim: q.get('zoomanim') === '1',
     drones: num('drones', 0),
     roundPoly: q.get('round') === 'poly',
+    mode: q.get('mode') || '',
+    mouse: q.get('mouse') || '',
+    api: q.get('api') === '1',
     seed: num('seed', 1),
     console: q.get('console') !== '0',
     tick: 1 / 30,
@@ -107,6 +113,7 @@
   const barrel = []; // [simT, angle] per rendered frame
   let ZCUR = P.zoom;
   if (P.console) window.input = { execute: (c) => { stats.console.push(c); } };
+  if (P.mode) window.__common__ = { active_gamemode: P.mode, screen_state: 'game', party_link: '' };
 
   function newEnemy(spec) {
     if (spec && spec.score !== undefined) spec = Object.assign({}, spec, { level: levelOfScore(spec.score) });
@@ -136,10 +143,16 @@
   makeEnemies(); makeShapes();
 
   /* ---------------- input ---------------- */
-  addEventListener('mousemove', (e) => {
-    inputs.push({ t: simT, wx: player.x + (e.clientX - cv.width / 2) / ZCUR, wy: player.y + (e.clientY - cv.height / 2) / ZCUR });
+  function pushInput(cx, cy) {
+    inputs.push({ t: simT, wx: player.x + (cx - cv.width / 2) / ZCUR, wy: player.y + (cy - cv.height / 2) / ZCUR });
     if (inputs.length > 400) inputs.shift();
+  }
+  addEventListener('mousemove', (e) => {
+    if (P.mouse === 'pointer' || (P.mouse === 'trusted' && !e.isTrusted)) return;
+    pushInput(e.clientX, e.clientY);
   });
+  addEventListener('pointermove', (e) => { if (P.mouse === 'pointer') pushInput(e.clientX, e.clientY); });
+  if (P.api) { window.input = window.input || {}; window.input.mouse = (x, y) => pushInput(x, y); }
   addEventListener('mousedown', (e) => { if (!e.isTrusted) { stats.synthMouseDown++; return; } if (e.button === 0) mouseHold = true; });
   addEventListener('mouseup', (e) => { if (e.isTrusted && e.button === 0) mouseHold = false; });
   addEventListener('keydown', (e) => {

@@ -251,18 +251,16 @@ for (const q of ['zoom=0.5', 'zoom=1.3&wrap=0']) {
   await ctx.close();
 }
 
-/* 12. refuses to run on diep.io */
+/* 12. on diep.io the menu loads, and the aids that act on other players are locked unless the lobby is a Sandbox (details: test/diepio.mjs) */
 {
   const ctx = await browser.newContext({ viewport: { width: 800, height: 600 } });
   const page = await ctx.newPage();
   await page.route('http://diep.io/**', (r) => r.fulfill({ status: 200, contentType: 'text/html', body: fs.readFileSync(path.join(here, 'mock-diep.html'), 'utf8') }));
-  const warnings = [];
-  page.on('console', (m) => warnings.push(m.text()));
   await page.addInitScript({ path: SCRIPT });
   await page.goto('http://diep.io/mock');
   await page.waitForTimeout(800);
-  const has = await page.evaluate(() => typeof window.diepAssist);
-  check('does nothing on diep.io', has === 'undefined' && warnings.some((w) => w.includes('Disabled on the public diep.io')), has);
+  const r = await page.evaluate(() => ({ api: typeof window.diepAssist, panel: !!document.getElementById('da-panel') && getComputedStyle(document.getElementById('da-panel')).display !== 'none', open: window.diepAssist && diepAssist.lobby().open }));
+  check('on diep.io the menu loads, but the aids stay locked outside a Sandbox', r.api === 'object' && r.panel && r.open === false, JSON.stringify(r));
   await ctx.close();
 }
 

@@ -1,16 +1,30 @@
 # Diep Assist
 
-A Tampermonkey userscript for a **private diep.io-style server you run yourself**: natural-looking predictive auto-aim
-that goes for the right tank, auto-fire, ESP, shape farming, an auto-build scheduler and quality-of-life tools.
-It refuses to run on the public `diep.io` (any `*.diep.io` host) - keep it that way, it is for your own server.
+A Tampermonkey userscript for **diep.io Sandbox lobbies and private servers you run yourself**: natural-looking predictive
+auto-aim that goes for the right tank, auto-fire, ESP, shape farming, an auto-build scheduler and quality-of-life tools.
+It loads on `diep.io` and on `localhost`. On diep.io the aids that act on other players (aim, fire, farm, ESP) only run in a
+**Sandbox** lobby or in a lobby you confirm as private (see "On diep.io" below); in public matches they stay off.
 
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/).
-2. Create a new script and paste in `diep-assist.user.js`.
-3. Edit the `@match` lines at the top so they cover **only your server** (`localhost` / `127.0.0.1` are already there;
-   replace `YOUR-PRIVATE-SERVER.example`). Tampermonkey injects at `document-start`, which the canvas hooks need.
-4. Open the game. **Insert** shows/hides the menu.
+2. Create a new script and paste in the **whole** of `diep-assist.user.js` - header included, because Tampermonkey reads the
+   `@match` lines from it (if you updated an older copy and nothing appears, replace the entire text and save). Chrome may
+   ask you to switch on "Allow User Scripts" for Tampermonkey (chrome://extensions -> Tampermonkey -> Details).
+3. The header already matches `diep.io`, `localhost` and `127.0.0.1`; add another `@match` line for a server of your own
+   (replace `YOUR-PRIVATE-SERVER.example`). Tampermonkey injects at `document-start`, which the canvas hooks need.
+4. Reload the game page. The menu appears at the top right, a small **DA** badge sits bottom left (click it to show / hide the
+   menu), and **Insert** does the same. If it cannot start, a red box on the page says why.
+
+### On diep.io
+
+The menu, auto build, the setup check, the diagnostics and the frame recorder always work. Aim, auto fire, farm and the ESP run when
+the game reports a **Sandbox** lobby (`window.__common__.active_gamemode`), which turns the menu banner green by itself. In any other
+mode the banner says they are off. If you are in your own private lobby that the game does not identify as a Sandbox, press
+**This is my private lobby** in the banner and confirm: that unlocks them for that lobby (it is remembered for the tab, and asks
+again for another lobby link). Use it only where everyone in the lobby knows aim assist is on. On `localhost` and your own server
+nothing is restricted. Nobody else is in a solo Sandbox, so to see the aim work there turn on **Farm shapes** (`;`) or invite a
+friend; **Misc -> Run setup check** reports what the script sees and whether the game obeys its cursor moves.
 
 | Default key | Action | | Default key | Action |
 |---|---|---|---|---|
@@ -69,6 +83,8 @@ circle for a body, grey `#999999` polygons drawn before it for barrels, `fillTex
 bars for health) and the script has fallbacks (a round object at the screen centre is taken as your tank).
 
 If the status says it cannot find your tank:
+0. **Misc -> Run setup check** first: it lists what is seen (canvas, tank, barrel, text) and tests whether the game follows the
+   script's cursor moves (synthetic mouse events, pointer events, or the game's own `input.mouse`, whichever it obeys).
 1. Spawn into the game with a tank on screen and some other tank or the leaderboard visible.
 2. **Misc -> Record 2 frames to a file.** It saves *every* canvas call of two complete frames, including the offscreen canvases
    the game draws into, with only the changed state per call.
@@ -86,13 +102,18 @@ inherit my velocity* (if shots miss only while you strafe), the other *Fire meth
   optionally with text in offscreen canvases, circles as polygons, drones, a breathing zoom and a rough network. Feature checks
   (`features.mjs` 28, `features2.mjs` 33, `replay-check.mjs` 21) pass in every style.
 * **Benchmark opponents (my own, not real):** `bench/` - see `bench/RESULTS.md`.
+* **diep.io behaviour (`test/diepio.mjs`):** the mock served as `https://diep.io/` (nothing touches the real site): menu and badge appear,
+  locked in a public mode, unlocked by a Sandbox mode or by the confirmation, mode changes while playing, CSP without inline styles,
+  start-up errors shown, the mouse-control self test. The Sandbox signal `window.__common__.active_gamemode` is what I remember the
+  client exposing - **it has not been checked on the real site**; if the game reports it differently the banner just stays orange and
+  the confirmation button is the way in (the diagnostics report lists the keys the page exposes).
 * **Not verified:** anything involving a real tank/barrel/text/health-bar frame, real server timing, or real players' dodging.
 
 ## Tests (no game server needed)
 
 ```
 npm install && npx playwright install chromium
-npm test                       # features.mjs + features2.mjs + replay-check.mjs
+npm test                       # features.mjs + features2.mjs + replay-check.mjs + diepio.mjs
 node test/run.mjs              # hit-rate + smoothness matrix (--baseline old.js to compare)
 node test/lockon.mjs           # lock-on speed / acceleration / jerk
 node test/trace.mjs out.png    # barrel angle + speed plot

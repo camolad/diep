@@ -1,30 +1,38 @@
 // ==UserScript==
-// @name         Diep Assist (private server testing)
+// @name         Diep Assist
 // @namespace    https://github.com/camolad/diep
-// @version      2.2.0
-// @description  Smooth predictive auto-aim, auto-fire, ESP, shape farming, auto-build scheduler and quality-of-life tools for a private diep.io-style server you run yourself.
+// @version      2.3.0
+// @description  Predictive auto-aim, auto-fire, ESP, shape farming, auto-build and quality-of-life tools for diep.io Sandbox lobbies and private servers.
+// @match        *://diep.io/*
+// @match        *://*.diep.io/*
 // @match        http://localhost/*
 // @match        http://localhost:*/*
 // @match        http://127.0.0.1/*
 // @match        http://127.0.0.1:*/*
 // @match        https://YOUR-PRIVATE-SERVER.example/*
 // @run-at       document-start
+// @sandbox      raw
 // @grant        none
 // @noframes
 // ==/UserScript==
 
 /*
- * SETUP: edit the @match lines above so they only cover your own private server.
- * The script refuses to run on the public diep.io.
+ * SETUP: paste this WHOLE file (header included) into a new Tampermonkey script, save, then reload the game page.
+ * Chrome may ask you to switch on "Allow User Scripts" for Tampermonkey (chrome://extensions -> Tampermonkey -> Details).
+ * It loads on diep.io and on localhost; add your own server's address as another @match line.
  *
- * Open / close the menu with Insert (rebindable in the Misc tab).
+ * On diep.io the aids that act on other players (aim, fire, farm, ESP) only run in a Sandbox lobby (the game reports the
+ * mode itself) or in a lobby you confirm in the menu as your own private one. In public matches they stay off. The menu,
+ * auto build, the setup check and the diagnostics always work.
+ *
+ * Open / close the menu with Insert, or click the small DA badge in the corner (keys are rebindable in the Misc tab).
  * Default hotkeys:  \ aim   [ fire   ] ESP   ; farm shapes   ' prediction   Delete master switch
  *
  * HOW IT WORKS
  *   diep draws everything on one <canvas>, so there is no DOM to query. The script wraps a few
  *   CanvasRenderingContext2D methods and rebuilds, every frame, a list of what was drawn:
- *     - tank   = grey parts (barrels, bases, turrets) followed by a body (two circles: border + fill)
- *     - bullet = the same circle pair without grey parts
+ *     - tank   = grey parts (barrels, bases, turrets) followed by a body (a filled + stroked circle)
+ *     - bullet = a round body without grey parts
  *     - shape  = a polygon filled with one of the four shape colours
  *   The camera is followed through the background grid pattern (and the shapes), so enemies can be
  *   tracked in world coordinates. Each enemy gets a least-squares position/velocity track, and the
@@ -37,11 +45,8 @@
 
   if (window.__diepAssistLoaded) return;
   window.__diepAssistLoaded = true;
-  const VERSION = '2.2.0';
-  if (/(^|\.)diep\.io\.?$/i.test(location.hostname)) {
-    console.warn('[Diep Assist] Disabled on the public diep.io - this script is for private servers you run yourself.');
-    return;
-  }
+  const VERSION = '2.3.0';
+  try { console.info('[Diep Assist] v' + VERSION + ' loaded on ' + location.host); } catch { /* ignore */ }
 
   /* ===================================================================== *
    *  1. Utilities
@@ -133,6 +138,7 @@
     renRawHealth: false,
     renHideUi: false,
     netPredict: true,
+    inputMethod: 'events', // how the cursor is moved: events | pointer | api | apiDpr (the setup check picks one that the game obeys)
     keys: {
       menu: 'Insert',
       master: 'Delete',
@@ -181,7 +187,7 @@
     self: null, me: null, selfCol: null, selfTrack: null, selfSeenT: -1e9, noSelf: 99, wasDown: true,
     tanks: [], shapes: [], target: null, targetSince: 0, sol: null,
     mouse: { x: innerWidth / 2, y: innerHeight / 2 }, mouseTh: null, mouseThT: 0, mouseW: 0, pivot: null,
-    mouseSpeed: 0, mouseLastT: 0, mouseLastX: 0, mouseLastY: 0, chal: null, tableOk: true,
+    mouseSpeed: 0, mouseLastT: 0, mouseLastX: 0, mouseLastY: 0, chal: null, tableOk: true, testing: false,
     mouseL: false, spaceDown: false, holdDown: false, panelHover: false,
     playing: false, spawnT: 0, lastPlayingT: -1e9,
     dom: { menu: false, dead: false, t: -1e9 },
@@ -231,6 +237,48 @@
     if (a.s < 0.12 || b.s < 0.12) return false;
     const d = Math.abs(a.h - b.h);
     return Math.min(d, 360 - d) < 25;
+  }
+
+  /* ===================================================================== *
+   *  3b. Lobby: where the aids that act on other players may run
+   * ===================================================================== */
+  // diep.io's Sandbox is a private lobby (you share a link); every other mode there is a public match. On diep.io the script always
+  // loads (menu, auto build, setup check, diagnostics), but aim, fire, farm and the ESP only run when the game reports a Sandbox, or
+  // when the player has confirmed the current lobby as a private one. On localhost / your own server nothing is restricted.
+  const PUBLIC_HOST = /(^|\.)diep\.io\.?$/i.test(location.hostname);
+  function gameMode() {
+    try {
+      const c = window.__common__;
+      const m = c && (c.active_gamemode !== undefined ? c.active_gamemode : c.gamemode);
+      return typeof m === 'string' ? m.toLowerCase() : '';
+    } catch { return ''; }
+  }
+  const LOBBY_STORE = 'diepAssist.lobbyOk';
+  let lobbyMem = '', lobbyCache = { t: -1e9, v: null };
+  const lobbyId = () => (location.hash || '#') + '|' + gameMode();
+  function lobby() { // { open, kind: own | sandbox | confirmed | locked, mode, text }
+    const t = nowMs();
+    if (lobbyCache.v && t - lobbyCache.t < 250) return lobbyCache.v;
+    const mode = gameMode();
+    let v;
+    if (!PUBLIC_HOST) v = { open: true, kind: 'own', mode, text: '' };
+    else if (/sandbox/.test(mode)) v = { open: true, kind: 'sandbox', mode, text: 'Sandbox lobby detected: all features on.' };
+    else {
+      let ok = lobbyMem !== '' && lobbyMem === lobbyId();
+      try { ok = ok || sessionStorage.getItem(LOBBY_STORE) === lobbyId(); } catch { /* storage blocked */ }
+      v = ok ? { open: true, kind: 'confirmed', mode, text: 'Unlocked by you for this lobby: all features on.' }
+        : { open: false, kind: 'locked', mode, text: mode ? `Public lobby (${mode}): aim, fire, farm and ESP are off.` : 'Aim, fire, farm and ESP are off: this is diep.io and the game did not report a Sandbox.' };
+    }
+    lobbyCache = { t, v };
+    return v;
+  }
+  const privateOk = () => lobby().open;
+  // the player says this lobby is private (a Sandbox / a game they host where everybody knows aim assist is on)
+  function confirmLobby(on) {
+    lobbyMem = on ? lobbyId() : '';
+    try { if (on) sessionStorage.setItem(LOBBY_STORE, lobbyId()); else sessionStorage.removeItem(LOBBY_STORE); } catch { /* storage blocked */ }
+    lobbyCache.v = null;
+    return lobby();
   }
 
   /* ===================================================================== *
@@ -588,8 +636,15 @@
     const nearGray = (x, y, r) => grays.some((g) => hyp(g.x - x, g.y - y) < r * 4);
     function place(x, y, r, col) {
       if (r < 3) return;
-      if (nearGray(x, y, r)) f.tanks.push({ x, y, r, col });
-      else f.bullets.push({ x, y, r, col });
+      if (nearGray(x, y, r)) {
+        // which way the barrels point: the mean direction from the body to the grey parts around it (undefined when they cancel out)
+        let sx = 0, sy = 0, nb = 0;
+        for (const g of grays) {
+          const d = hyp(g.x - x, g.y - y);
+          if (d > r * 0.2 && d < r * 4) { sx += (g.x - x) / d; sy += (g.y - y) / d; nb++; }
+        }
+        f.tanks.push({ x, y, r, col, nb, ang: nb && hyp(sx, sy) > 0.35 * nb ? Math.atan2(sy, sx) : undefined });
+      } else f.bullets.push({ x, y, r, col });
       grays = [];
     }
     function flush() { if (pend) { place(pend.x, pend.y, pend.r, pend.col); pend = null; } }
@@ -1813,19 +1868,31 @@
     sd.x = goal + (d + tmp) * e;
   }
 
-  function dispatchMouse(x, y) {
+  // How the cursor is moved. `events` (default): a synthetic mousemove on the game canvas. The others exist for a client that ignores
+  // untrusted events: `pointer` also sends a pointermove, `api` / `apiDpr` call the game's own input.mouse(x, y) (canvas px, or device px).
+  // The setup check tries them in turn and keeps the first one the game obeys.
+  function sendMouse(method, x, y) {
+    if (method === 'api' || method === 'apiDpr') {
+      const f = window.input && window.input.mouse;
+      if (typeof f === 'function') {
+        try {
+          const r = S.rect || { left: 0, top: 0 }, k = method === 'apiDpr' ? window.devicePixelRatio || 1 : 1;
+          f.call(window.input, (x - r.left) * k, (y - r.top) * k);
+          return;
+        } catch { /* fall back to events */ }
+      }
+    }
     const c = S.canvas;
-    const ev = new MouseEvent('mousemove', {
-      clientX: x, clientY: y, screenX: x + (window.screenX || 0), screenY: y + (window.screenY || 0),
-      bubbles: true, cancelable: true, composed: true, view: window,
-    });
-    (c || window).dispatchEvent(ev);
+    const init = { clientX: x, clientY: y, screenX: x + (window.screenX || 0), screenY: y + (window.screenY || 0), bubbles: true, cancelable: true, composed: true, view: window };
+    (c || window).dispatchEvent(new MouseEvent('mousemove', init));
+    if (method === 'pointer') { try { (c || window).dispatchEvent(new PointerEvent('pointermove', { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch { /* ignore */ } }
   }
+  const dispatchMouse = (x, y) => sendMouse(cfg.inputMethod, x, y);
 
   const gaussR = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
 
   function canEngage() {
-    if (!cfg.enabled || !cfg.aim || !S.playing || ctl.suspended || !S.sol || !S.pivot) return false;
+    if (!cfg.enabled || !cfg.aim || !S.playing || ctl.suspended || S.testing || !S.sol || !S.pivot || !privateOk()) return false;
     if (cfg.panelPause && S.panelHover) return false;
     if (nowMs() < ctl.yieldUntil) return false; // the player flicked the mouse: hand the barrel back for a moment
     // a tank spotted a moment ago has no velocity estimate yet: wait until it has one
@@ -1958,7 +2025,7 @@
   function fireControl(t) {
     let want = false;
     const sol = S.sol;
-    if (cfg.enabled && cfg.autoFire && S.playing && sol && ctl.on) {
+    if (cfg.enabled && cfg.autoFire && privateOk() && S.playing && sol && ctl.on) {
       const tolOk = ctl.err <= Math.max(0.035, sol.tol * (cfg.fireTolerance / 100));
       want = tolOk && sol.T <= cfg.fireMaxFlight && sol.conf >= cfg.fireConfidence / 100;
       // hysteresis: keep firing through short dips in confidence
@@ -2120,6 +2187,67 @@
   }
 
   /* ===================================================================== *
+   *  11b. Setup check: does the game obey the script, and what does it see?
+   * ===================================================================== */
+  const nextFrame = () => new Promise((res) => raf(res));
+  // Turns the barrel a quarter turn with each way of moving the cursor in turn and keeps the first one the game obeys. The barrel's
+  // direction is read from the grey parts drawn around my own tank. Needs my tank on screen, and a lobby where the aids are allowed.
+  async function inputTest() {
+    if (!privateOk()) return { ok: null, note: 'locked in this lobby: unlock it first (the test turns the barrel)' };
+    if (!S.playing || !S.pivot || !S.self || S.self.ang === undefined) return { ok: null, note: 'spawn into the game first, with the barrel in view' };
+    if (S.testing) return { ok: null, note: 'a test is already running' };
+    S.testing = true;
+    const out = { ok: false, tried: [] };
+    try {
+      releaseNow(S.mouse.x, S.mouse.y);
+      const methods = ['events', 'pointer'];
+      if (window.input && typeof window.input.mouse === 'function') methods.push('api', 'apiDpr');
+      for (const m of methods) {
+        const a0 = S.self && S.self.ang;
+        if (a0 === undefined || !S.pivot) break;
+        const target = a0 + Math.PI / 2;
+        const px = S.pivot.x + Math.cos(target) * 220, py = S.pivot.y + Math.sin(target) * 220;
+        const t0 = nowMs();
+        while (nowMs() - t0 < 800) { sendMouse(m, px, py); await nextFrame(); }
+        const a1 = S.self ? S.self.ang : undefined;
+        const err = a1 === undefined ? null : Math.round((Math.abs(wrapAngle(a1 - target)) * 180) / Math.PI);
+        out.tried.push({ method: m, errorDeg: err });
+        const t1 = nowMs();
+        while (nowMs() - t1 < 450) { sendMouse(m, S.mouse.x, S.mouse.y); await nextFrame(); } // the barrel goes back to the player's mouse
+        if (err !== null && err < 30) { out.ok = true; out.method = m; break; }
+      }
+      if (out.ok && out.method !== cfg.inputMethod) { cfg.inputMethod = out.method; save(); }
+    } finally {
+      S.testing = false;
+      dispatchMouse(S.mouse.x, S.mouse.y);
+    }
+    S.inputResult = { t: nowMs(), ...out };
+    return out;
+  }
+  async function runCheck(withInput) {
+    const rows = [];
+    const add = (label, ok, detail) => rows.push({ label, ok, detail: detail || '' });
+    const L = lobby(), f = S.ready;
+    add('Script', true, `v${VERSION} on ${location.host}${PUBLIC_HOST ? ' (mode: ' + (L.mode || 'not reported') + ')' : ''}`);
+    if (PUBLIC_HOST) add('Lobby', L.open, L.text);
+    add('Game canvas', !!S.canvas, S.canvas ? `${S.canvas.width}x${S.canvas.height} px` : 'not found yet (is the game running?)');
+    add('Drawing seen', !!f && nowMs() - f.t < 1500, f ? `${Math.round(S.fps)} fps; ${f.tanks.length} tanks, ${f.bullets.length} round objects, ${f.shapes.length} shapes, ${f.drones.length} small polygons` : 'no frame yet');
+    add('My tank', !!S.self, S.self ? `radius ${S.self.r.toFixed(1)} px` + (S.self.ang === undefined ? ', barrel not seen' : `, barrel at ${Math.round((S.self.ang * 180) / Math.PI)} deg`) : S.dom.menu ? 'you are in the menu: spawn first' : 'not found at the screen centre');
+    add('Enemy tanks', null, `${S.tanks.filter((t) => t.seen).length} on screen`);
+    add('Text (names / leaderboard / score)', f ? f.texts.length > 0 : null, f ? `${f.texts.length} labels` + (S.leaderboard.length ? `, ${S.leaderboard.length} leaderboard rows` : '') + (S.myScore !== null ? `, my score ${fmtScore(S.myScore)}` : '') : '');
+    add('Game console', hasConsole(), hasConsole() ? 'input.execute found (auto build can use it)' : 'not found (auto build will type the keys)');
+    if (withInput) {
+      const r = await inputTest();
+      add('Mouse control', r.ok, r.ok ? `the game follows ${r.method} cursor moves` : r.note || 'the game did not follow the cursor (' + r.tried.map((q) => `${q.method}: ${q.errorDeg === null ? 'barrel lost' : q.errorDeg + ' deg off'}`).join(', ') + ')');
+    } else if (S.inputResult) {
+      const r = S.inputResult;
+      add('Mouse control (last test)', r.ok, r.ok ? `ok with ${r.method}, ${Math.round((nowMs() - r.t) / 1000)} s ago` : r.note || 'failed ' + Math.round((nowMs() - r.t) / 1000) + ' s ago');
+    }
+    S.check = { t: nowMs(), rows };
+    return rows;
+  }
+
+  /* ===================================================================== *
    *  12. Frame processing and main loop
    * ===================================================================== */
   function processFrame(f) {
@@ -2133,7 +2261,7 @@
     detectSelf(f, f.t);
     // where my tank is on screen: as drawn, or (for the frames it is hidden by a hit flash) where it should be
     const st = S.selfTrack;
-    if (S.self) S.me = { x: S.self.x, y: S.self.y, r: S.self.r };
+    if (S.self) S.me = { x: S.self.x, y: S.self.y, r: S.self.r, ang: S.self.ang };
     else if (st && f.t - st.last < 300) {
       const age = (f.t - st.last) / 1000;
       S.me = { x: toSX(st.x + st.vx * age), y: toSY(st.y + st.vy * age), r: st.rW * cam.zoom };
@@ -2156,7 +2284,7 @@
     if (playing) S.lastPlayingT = f.t;
 
     let sol = null;
-    if (playing && cfg.enabled) {
+    if (playing && cfg.enabled && privateOk()) {
       const tk = pickTarget(f.t);
       if (tk) {
         if (tk !== S.target) { S.target = tk; S.targetSince = f.t; }
@@ -2224,6 +2352,7 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
     if (cfg.clean) return;
+    if (!privateOk()) { drawHud(ctx, W); return; } // public lobby: no ESP, only the note that explains why
     if (!cfg.enabled || !S.canvas || !S.rect || !S.playing) { drawHud(ctx, W); return; }
 
     const k = S.k, Z = cam.zoom, tau = cfg.persistence;
@@ -2340,6 +2469,7 @@
   }
   function drawHud(ctx, W) {
     if (!cfg.hud) return;
+    if (!privateOk()) { drawNote(ctx, W, 'Diep Assist: ' + lobby().text + ' Open the menu (' + keyLabel(cfg.keys.menu) + ') to unlock a private lobby.'); return; }
     if (cfg.enabled && !S.playing) { if (S.noSelf > 180 && S.ready && !S.dom.menu && !S.dom.dead) drawNote(ctx, W, 'Diep Assist: ' + why()); return; }
     const lines = [];
     const sol = S.sol;
@@ -2426,12 +2556,23 @@
   function saveProfile(n) { const p = profiles(); p[n] = exportSettings(); try { localStorage.setItem(PROFILE_KEY, JSON.stringify(p)); return true; } catch { return false; } }
   function loadProfile(n) { const p = profiles()[n]; return p ? importSettings(p) : false; }
 
+  // what the game page exposes about the current game (the keys and simple values of window.__common__), to adapt the lobby detection
+  function commonSnapshot() {
+    try {
+      const c = window.__common__;
+      if (!c || typeof c !== 'object') return null;
+      const o = {};
+      for (const k of Object.keys(c).slice(0, 60)) { const v = c[k]; o[k] = v === null || typeof v === 'number' || typeof v === 'boolean' ? v : typeof v === 'string' ? v.slice(0, 60) : typeof v; }
+      return o;
+    } catch { return null; }
+  }
   // Everything needed to see what the script sees (paste it back when something does not line up on a server).
   function report() {
     const f = S.ready;
     return {
       version: VERSION, time: new Date().toISOString(), host: location.host, ua: navigator.userAgent,
       window: { w: innerWidth, h: innerHeight, dpr: window.devicePixelRatio },
+      lobby: { publicHost: PUBLIC_HOST, mode: gameMode(), state: lobby(), hash: location.hash ? '(set)' : '', common: commonSnapshot(), inputApi: window.input ? Object.keys(window.input).slice(0, 30) : null, inputMethod: cfg.inputMethod, lastInputTest: S.inputResult || null },
       cfg: JSON.parse(exportSettings()).cfg,
       state: {
         playing: S.playing, canvas: S.canvas ? { id: S.canvas.id, w: S.canvas.width, h: S.canvas.height } : null,
@@ -2491,6 +2632,14 @@
   .da-tl{display:flex;flex-wrap:wrap;gap:2px;margin:2px 0 4px}
   .da-chip{width:18px;height:18px;line-height:18px;text-align:center;border-radius:4px;color:#101216;font:700 10px ui-monospace,Menlo,Consolas,monospace;cursor:default}
   .da-presets{display:flex;flex-wrap:wrap;gap:5px;margin:4px 0 8px}
+  .da-chk{display:flex;gap:6px;font-size:11px;line-height:1.35;padding:1px 0}.da-chk b{width:12px;flex:none}.da-chk.ok b{color:#7be39a}.da-chk.bad b{color:#ff8a8a}.da-chk span{min-width:0;overflow-wrap:anywhere}
+  #da-lock{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:11px;line-height:1.3;border-bottom:1px solid rgba(255,255,255,.08)}
+  #da-lock.locked{background:rgba(255,160,40,.16);color:#ffd9a0}
+  #da-lock.sandbox,#da-lock.confirmed{background:rgba(75,227,122,.12);color:#b6f0c8}
+  #da-locktext{flex:1;min-width:0}
+  #da-badge{position:fixed;left:10px;bottom:10px;z-index:2147483600;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    background:rgba(19,20,26,.8);color:#fff;font:700 10px system-ui,sans-serif;cursor:pointer;border:2px solid #666;opacity:.7;user-select:none}
+  #da-badge.ok{border-color:#4be37a}#da-badge.locked{border-color:#ffb347}#da-badge:hover{opacity:1}
   #da-toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);z-index:2147483601;background:rgba(15,17,22,.9);color:#fff;
     padding:6px 14px;border-radius:7px;font:600 13px system-ui,sans-serif;pointer-events:none;opacity:0;transition:opacity .18s}
   `;
@@ -2512,6 +2661,7 @@
 
   const refreshers = [];
   let panel = null, body = null, statusEl = null, dotEl = null, toastEl = null, quickEls = {};
+  let lockEl = null, lockTextEl = null, lockBtn = null, badgeEl = null;
 
   function setCfg(key, value) { cfg[key] = value; save(); refreshAll(); }
   function refreshAll() { for (const r of refreshers) r(); }
@@ -2654,6 +2804,10 @@
       ...[1, 2, 3].map((n) => h('div', { class: 'da-row' }, h('div', { class: 'da-l' }, 'Profile ' + n),
         h('button', { class: 'da-btn', onclick: () => toast(saveProfile(n) ? 'Saved to profile ' + n : 'Could not save') }, 'Save'),
         h('button', { class: 'da-btn', onclick: () => toast(loadProfile(n) ? 'Loaded profile ' + n : 'Profile ' + n + ' is empty') }, 'Load'))),
+      sec('Setup check'),
+      h('div', { class: 'da-row' }, h('button', { class: 'da-btn', onclick: async () => { toast('Checking...'); renderCheck(await runCheck(true)); } }, 'Run setup check'),
+        h('span', { class: 'da-note', style: 'margin:0' }, 'spawn first - it turns the barrel for a second')),
+      h('div', { id: 'da-check' }),
       sec('Session'),
       h('div', { class: 'da-row' }, h('div', { class: 'da-l', id: 'da-why', style: 'opacity:.8' }, '')),
       h('div', { class: 'da-row' }, h('div', { class: 'da-l', id: 'da-stats' }, ''), h('button', { class: 'da-btn', onclick: () => { S.stats.shots = 0; S.stats.hits = 0; } }, 'reset')),
@@ -2732,7 +2886,7 @@
 
   function buildPanel() {
     if (panel || !document.body) return;
-    document.head.append(h('style', null, CSS));
+    (document.head || document.documentElement).append(h('style', null, CSS));
     const quick = h('div', { id: 'da-quick' });
     for (const [key, label] of [['aim', 'Aim'], ['autoFire', 'Fire'], ['esp', 'ESP'], ['farm', 'Farm']]) {
       const el = h('div', { class: 'da-pill', onclick: () => setCfg(key, !cfg[key]) }, label);
@@ -2743,9 +2897,21 @@
     const head = h('div', { id: 'da-head' }, dotEl, h('b', null, 'Diep Assist'), statusEl, h('span', { class: 'da-x', title: 'Hide (' + keyLabel(cfg.keys.menu) + ')', onclick: () => togglePanel() }, '×'));
     const tabs = h('div', { id: 'da-tabs' }, Object.keys(TABS).map((n) => h('div', { class: 'da-tab', 'data-tab': n, onclick: () => showTab(n) }, n)));
     body = h('div', { id: 'da-body' });
-    panel = h('div', { id: 'da-panel' }, head, quick, tabs, body);
+    lockTextEl = h('span', { id: 'da-locktext' });
+    lockBtn = h('button', { class: 'da-btn', id: 'da-lockbtn', onclick: () => onLockButton() });
+    lockEl = h('div', { id: 'da-lock' }, lockTextEl, lockBtn);
+    panel = h('div', { id: 'da-panel' }, head, lockEl, quick, tabs, body);
     toastEl = h('div', { id: 'da-toast' });
-    document.body.append(panel, toastEl);
+    badgeEl = h('div', { id: 'da-badge', title: 'Diep Assist - click to show / hide the menu' }, 'DA');
+    badgeEl.addEventListener('click', () => togglePanel());
+    document.body.append(panel, toastEl, badgeEl);
+    // a page that forbids inline <style> (Content-Security-Policy) leaves the menu unstyled: use a constructed stylesheet instead
+    try {
+      if (getComputedStyle(panel).position !== 'fixed' && typeof CSSStyleSheet === 'function' && 'adoptedStyleSheets' in document) {
+        const sh = new CSSStyleSheet(); sh.replaceSync(CSS);
+        document.adoptedStyleSheets = [...document.adoptedStyleSheets, sh];
+      }
+    } catch { /* ignore */ }
     if (cfg.ui.x !== null && cfg.ui.y !== null) {
       panel.style.left = clamp(cfg.ui.x, 0, innerWidth - 120) + 'px'; panel.style.top = clamp(cfg.ui.y, 0, innerHeight - 40) + 'px'; panel.style.right = 'auto';
     }
@@ -2779,6 +2945,7 @@
     if (panel) panel.style.display = cfg.ui.open && !cfg.clean ? '' : 'none';
     if (S.overlay) S.overlay.style.display = cfg.clean ? 'none' : '';
     if (toastEl) toastEl.style.display = cfg.clean ? 'none' : '';
+    if (badgeEl) badgeEl.style.display = cfg.clean ? 'none' : '';
     if (cfg.clean) S.panelHover = false;
   }
   function togglePanel() {
@@ -2788,16 +2955,17 @@
     if (!cfg.ui.open) S.panelHover = false;
   }
   let toastTimer = 0;
-  function toast(msg) {
+  function toast(msg, ms = 1300) {
     if (!toastEl || cfg.clean) return;
     toastEl.textContent = msg; toastEl.style.opacity = '1';
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { toastEl.style.opacity = '0'; }, 1300);
+    toastTimer = setTimeout(() => { toastEl.style.opacity = '0'; }, ms);
   }
   let lastStatus = '';
   // A plain-language answer to "why is nothing happening?"
   function why() {
     if (!cfg.enabled) return 'switched off';
+    if (!privateOk()) return lobby().text + ' Unlock it in the menu if this is your private lobby.';
     if (!S.canvas) return 'no game canvas found yet';
     const f = S.ready;
     if (!f) return 'waiting for the first frame';
@@ -2816,10 +2984,35 @@
     if (!ctl.on) return 'target ' + who + ' selected, waiting (' + (cfg.aimMode === 'hold' ? 'hold the aim key' : cfg.aimMode === 'firing' ? 'start firing' : cfg.aimMode === 'near' ? 'point nearer the target' : 'arming') + ')';
     return 'locked on ' + who;
   }
+  function renderCheck(rows) {
+    const el = document.getElementById('da-check');
+    if (!el) return;
+    el.textContent = '';
+    for (const r of rows) el.append(h('div', { class: 'da-chk ' + (r.ok === true ? 'ok' : r.ok === false ? 'bad' : '') }, h('b', null, r.ok === true ? '\u2713' : r.ok === false ? '\u2717' : '\u2013'), h('span', null, r.label + (r.detail ? ': ' + r.detail : ''))));
+  }
+  function onLockButton() {
+    const L = lobby();
+    if (L.kind === 'locked') {
+      if (confirm('Unlock aim, fire, farm and ESP for this lobby?\n\nOnly do this in a private lobby you host (for example a Sandbox) where every player knows aim assist is on.\nNever in a public match.')) { confirmLobby(true); toast('Unlocked for this lobby'); }
+    } else if (L.kind === 'confirmed') { confirmLobby(false); toast('Locked again'); }
+    refreshPanelStatus();
+  }
   function refreshPanelStatus() {
+    const L = lobby();
+    if (badgeEl) { const cls = L.open ? 'ok' : 'locked'; if (badgeEl.className !== cls) badgeEl.className = cls; }
     if (!panel || !cfg.ui.open) return;
+    if (lockEl) {
+      lockEl.style.display = PUBLIC_HOST ? '' : 'none';
+      if (lockEl.className !== L.kind) lockEl.className = L.kind;
+      if (lockTextEl.textContent !== L.text) lockTextEl.textContent = L.text;
+      const bt = L.kind === 'locked' ? 'This is my private lobby' : L.kind === 'confirmed' ? 'Lock again' : '';
+      if (lockBtn.textContent !== bt) lockBtn.textContent = bt;
+      const bd = bt ? '' : 'none';
+      if (lockBtn.style.display !== bd) lockBtn.style.display = bd;
+    }
     const txt = !cfg.enabled ? 'off' : S.playing ? (S.sol ? 'target #' + S.sol.tk.id : 'no target') : 'not in game';
     if (txt !== lastStatus) { lastStatus = txt; statusEl.textContent = txt; dotEl.classList.toggle('on', cfg.enabled && S.playing); }
+    if (nowMs() - (S.checkT || 0) > 1000 && document.getElementById('da-check') && !S.testing) { S.checkT = nowMs(); runCheck(false).then(renderCheck); }
     const wy = document.getElementById('da-why');
     if (wy) { const w = why(); if (wy.textContent !== w) wy.textContent = w; }
     const st = document.getElementById('da-stats');
@@ -2831,13 +3024,14 @@
   /* ===================================================================== *
    *  15. Input listeners
    * ===================================================================== */
+  const lockTail = () => (privateOk() ? '' : ' (locked in this lobby)');
   const ACTIONS = {
     menu: () => togglePanel(),
     master: () => { setCfg('enabled', !cfg.enabled); toast('Diep Assist ' + (cfg.enabled ? 'ON' : 'OFF')); },
-    aim: () => { setCfg('aim', !cfg.aim); toast('Auto aim ' + (cfg.aim ? 'ON' : 'OFF')); },
-    fire: () => { setCfg('autoFire', !cfg.autoFire); toast('Auto fire ' + (cfg.autoFire ? 'ON' : 'OFF')); },
-    esp: () => { setCfg('esp', !cfg.esp); toast('ESP ' + (cfg.esp ? 'ON' : 'OFF')); },
-    farm: () => { setCfg('farm', !cfg.farm); toast('Farm shapes ' + (cfg.farm ? 'ON' : 'OFF')); },
+    aim: () => { setCfg('aim', !cfg.aim); toast('Auto aim ' + (cfg.aim ? 'ON' : 'OFF') + lockTail()); },
+    fire: () => { setCfg('autoFire', !cfg.autoFire); toast('Auto fire ' + (cfg.autoFire ? 'ON' : 'OFF') + lockTail()); },
+    esp: () => { setCfg('esp', !cfg.esp); toast('ESP ' + (cfg.esp ? 'ON' : 'OFF') + lockTail()); },
+    farm: () => { setCfg('farm', !cfg.farm); toast('Farm shapes ' + (cfg.farm ? 'ON' : 'OFF') + lockTail()); },
     predict: () => { setCfg('predict', !cfg.predict); toast('Prediction ' + (cfg.predict ? 'ON' : 'OFF')); },
     lock: () => { // pin the current target until it is gone (or press again)
       if (S.pinId) { S.pinId = 0; toast('Target unpinned'); return; }
@@ -2924,14 +3118,29 @@
   /* ===================================================================== *
    *  16. Start
    * ===================================================================== */
+  // if anything goes wrong while starting, say so on the page instead of staying silent
+  function initError(e) {
+    try {
+      console.error('[Diep Assist] failed to start', e);
+      const box = document.createElement('div');
+      box.style.cssText = 'position:fixed;left:10px;bottom:10px;z-index:2147483647;background:#7a1d1d;color:#fff;font:12px/1.35 system-ui,sans-serif;padding:8px 10px;border-radius:6px;max-width:420px';
+      box.textContent = 'Diep Assist failed to start: ' + ((e && e.message) || e) + ' (see the browser console)';
+      (document.body || document.documentElement).appendChild(box);
+    } catch { /* ignore */ }
+  }
   function init() {
     if (S.overlay) return;
-    const oc = document.createElement('canvas');
-    oc.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483000;';
-    S.overlay = oc;
-    document.body.appendChild(oc);
-    S.octx = oc.getContext('2d');
-    buildPanel();
+    try {
+      const oc = document.createElement('canvas');
+      oc.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483000;';
+      S.overlay = oc;
+      document.body.appendChild(oc);
+      S.octx = oc.getContext('2d');
+    } catch (e) { initError(e); }
+    try {
+      buildPanel();
+      toast('Diep Assist ' + VERSION + ' loaded - menu: ' + keyLabel(cfg.keys.menu) + ' or the DA badge', 4500);
+    } catch (e) { initError(e); }
     raf(loop);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });
@@ -2940,7 +3149,7 @@
   // Handy for debugging from the console: diepAssist.cfg, diepAssist.S ...
   window.diepAssist = {
     version: VERSION, cfg, S, cam, ctl, bullet, F, applyBuild, scheduleBuild,
-    rank: () => S.rank, report, recordFrames, tier: applyTier, why, exportSettings, importSettings, saveProfile, loadProfile,
+    rank: () => S.rank, report, recordFrames, tier: applyTier, why, check: runCheck, inputTest, lobby, confirmPrivate: (on = true) => confirmLobby(on), exportSettings, importSettings, saveProfile, loadProfile,
     get: (key) => cfg[key],
     set: (key, value) => { if (key in cfg && key !== 'keys' && key !== 'ui') setCfg(key, value); }, // e.g. diepAssist.set('aim', true)
   };
