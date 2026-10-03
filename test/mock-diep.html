@@ -35,6 +35,7 @@
  *                                           xform = path built under the camera transform, one fill + one darker stroke;
  *                                           legacy = border circle + body circle (two fills)
  *                 zoomanim=1                the zoom breathes +-10 % every few seconds (level-up FOV change)
+ *                 round=poly                circles are drawn as 32-sided polygons (style=real only)
  *                 drones=4                  every enemy keeps this many triangular drones orbiting it
  *                 score=3000                my score (default: the middle of my level's range)
  * Enemies (addEnemy spec): name, level, score, hp, pattern, shoot, dodge:{bias,fav,react,speed}, half (periodic half-period, s)
@@ -64,6 +65,7 @@
     style: q.get('style') || 'real',
     zoomanim: q.get('zoomanim') === '1',
     drones: num('drones', 0),
+    roundPoly: q.get('round') === 'poly',
     seed: num('seed', 1),
     console: q.get('console') !== '0',
     tick: 1 / 30,
@@ -359,7 +361,9 @@
     } else {
       useIdentity();
       const [sx, sy] = toS(x, y);
-      ctx.beginPath(); ctx.arc(sx, sy, r * CAM.z, 0, Math.PI * 2);
+      ctx.beginPath();
+      if (P.roundPoly) { for (let i = 0; i < 32; i++) { const a = (i / 32) * Math.PI * 2; const px = sx + Math.cos(a) * r * CAM.z, py = sy + Math.sin(a) * r * CAM.z; if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); } ctx.closePath(); }
+      else ctx.arc(sx, sy, r * CAM.z, 0, Math.PI * 2);
       ctx.fillStyle = col[0]; ctx.fill(); ctx.fill();
       penTransform(ang || 0); ctx.lineWidth = pen; ctx.strokeStyle = col[1]; ctx.stroke();
       useIdentity();

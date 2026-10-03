@@ -29,6 +29,7 @@ const browser = await chromium.launch({ headless: true });
   check('real probe: translucent bases / margins are ignored', s.diag.ignored >= 4 && s.diag.bases === 0, JSON.stringify(s.diag));
   check('real probe: the 30 small blue polygons are seen once each (the client fills them twice)', s.drones.length === 30 && s.shapes.length === 0, `drones ${s.drones.length}, shapes ${s.shapes.length}`);
   check('real probe: nothing is mistaken for a tank or a bullet', s.tanks.length === 0 && s.bullets.length === 0);
+  check('real probe: the status explains why nothing is happening', /cannot find my tank.*30 drones/.test(s.why), s.why);
 }
 
 /* 2. recorder round trip on the mock arena */

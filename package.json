@@ -1,12 +1,14 @@
 {
   "name": "diep-assist",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "private": true,
-  "description": "Tampermonkey aim-assist / helper script for a private diep.io-style server, with an offline mock arena to test it",
+  "description": "Tampermonkey aim-assist / helper script for a private diep.io-style server, with an offline mock arena, recorded-frame replay and a predictor benchmark",
   "scripts": {
-    "test": "node test/features.mjs",
+    "test": "node test/features.mjs && node test/features2.mjs && node test/replay-check.mjs",
+    "test:replay": "node test/replay-check.mjs",
     "test:aim": "node test/run.mjs",
-    "test:lockon": "node test/lockon.mjs"
+    "test:lockon": "node test/lockon.mjs",
+    "bench": "node bench/sweep.mjs adaptive mild 16 100"
   },
   "devDependencies": {
     "playwright": "^1.56.1"

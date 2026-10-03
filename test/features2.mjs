@@ -227,6 +227,31 @@ for (const [mode, want] of [['closest', 'Bot-300'], ['auto', 'Tester'], ['score'
   await ctx.close();
 }
 
+/* 11. strength presets */
+{
+  const { page, ctx } = await open('pattern=still&lvl=25', {});
+  const r = await page.evaluate(() => {
+    const out = {};
+    diepAssist.tier('assist'); out.assist = [diepAssist.cfg.aim, diepAssist.cfg.aimMode, diepAssist.cfg.assist];
+    diepAssist.tier('off'); out.off = diepAssist.cfg.aim;
+    diepAssist.tier('full'); out.full = [diepAssist.cfg.aim, diepAssist.cfg.aimMode, diepAssist.cfg.assist, diepAssist.cfg.dodge];
+    out.bad = diepAssist.tier('nope');
+    return out;
+  });
+  check('strength presets set the aim options', r.assist.join() === 'true,near,45' && r.off === false && r.full.join() === 'true,always,100,true' && r.bad === false, JSON.stringify(r));
+  await ctx.close();
+}
+
+/* 12. the per-target learner picks up a strafing beat (the mock's periodic target reverses about every 0.55 s) */
+{
+  const { page, ctx } = await open('pattern=periodic&lvl=25', {});
+  await page.mouse.move(300, 500);
+  await page.waitForTimeout(9000);
+  const m = await page.evaluate(() => { const tk = diepAssist.S.tanks.find((t) => t.seen); const d = tk && tk.pred ? tk.pred.dbg() : null; return d && { period: d.r ? d.r.period : null, conf: d.r ? d.r.conf : 0, revs: d.revs.length }; });
+  check('detects the strafing beat of a periodic target', m && m.period > 0.42 && m.period < 0.7 && m.conf > 0.3, JSON.stringify(m));
+  await ctx.close();
+}
+
 console.log(`\n${pass} passed, ${failed} failed`);
 await browser.close(); server.close();
 process.exit(failed ? 1 : 0);

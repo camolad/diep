@@ -110,7 +110,7 @@ export async function replay(file, opts = {}) {
     const d = window.diepAssist, f = d.S.ready;
     if (!f) return null;
     const q = (v) => v.slice(0, 40).map((e) => ({ x: Math.round(e.x), y: Math.round(e.y), r: Math.round(e.r * 10) / 10, col: e.col && e.col.hex, nc: e.nc }));
-    return { tanks: q(f.tanks), bullets: q(f.bullets), shapes: q(f.shapes), drones: q(f.drones), bars: f.bars.length, texts: f.texts.map((t) => t.text).slice(0, 40), grid: f.grid, diag: f.diag, errors: d.S.lastError, canvas: [d.S.canvas.width, d.S.canvas.height] };
+    return { why: d.why(), tanks: q(f.tanks), bullets: q(f.bullets), shapes: q(f.shapes), drones: q(f.drones), bars: f.bars.length, texts: f.texts.map((t) => t.text).slice(0, 40), grid: f.grid, diag: f.diag, errors: d.S.lastError, canvas: [d.S.canvas.width, d.S.canvas.height] };
   });
   if (!opts.browser) await browser.close();
   server.close();

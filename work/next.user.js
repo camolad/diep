@@ -416,7 +416,7 @@
     const col = parseColor(fs);
     if (!col) return;
     const g = rectPrim(ctx, x, y, w, h);
-    if (g) { f.prims.push({ g, fc: col, sc: null, sw: 0, a: ctx.globalAlpha, cap: '', pid: -1, ver: 0 }); f.calls++; }
+    if (g) { f.prims.push({ g, fc: col, sc: null, sw: 0, a: ctx.globalAlpha * col.a, cap: '', pid: -1, ver: 0 }); f.calls++; }
   }
 
   // ---- path geometry ----
@@ -456,6 +456,14 @@
       const t1 = Math.atan2(b[1] - a[1], b[0] - a[0]), t2 = Math.atan2(c[1] - b[1], c[0] - b[0]);
       if (Math.abs(wrapAngle(t2 - t1)) > 0.31) nc++;
     }
+    // many vertices at an even distance from the centre: a circle drawn as a polygon
+    if (H.length >= 10) {
+      let sum = 0, dev = 0;
+      for (const p of H) sum += hyp(p[0] - cx, p[1] - cy);
+      const mean = sum / H.length;
+      for (const p of H) dev = Math.max(dev, Math.abs(hyp(p[0] - cx, p[1] - cy) - mean));
+      if (mean > 1 && dev / mean < 0.06) return { t: 'c', x: cx, y: cy, r: mean, poly: true };
+    }
     return { t: 'p', x: cx, y: cy, r, w: maxX - minX, h: maxY - minY, n, nc };
   }
   function pathGeom() {
@@ -480,7 +488,7 @@
     if (lp && lp.pid === PA.id && lp.ver === PA.ver) return; // the same path filled again (the client fills twice)
     const g = pathGeom();
     if (!g) return;
-    const p = { g, fc: col, sc: null, sw: 0, a: ctx.globalAlpha, cap: '', pid: PA.id, ver: PA.ver };
+    const p = { g, fc: col, sc: null, sw: 0, a: ctx.globalAlpha * col.a, cap: '', pid: PA.id, ver: PA.ver };
     f.prims.push(p); f.last = p; f.calls++;
   }
   function onStroke(ctx) {
@@ -2286,8 +2294,15 @@
     }
   }
 
+  function drawNote(ctx, W, text) {
+    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace'; ctx.textAlign = 'center';
+    const w = Math.min(W - 20, ctx.measureText(text).width + 14);
+    ctx.fillStyle = 'rgba(10,12,16,.55)'; ctx.fillRect(W / 2 - w / 2, 6, w, 17);
+    ctx.fillStyle = '#ffd98a'; ctx.fillText(text.length > 140 ? text.slice(0, 137) + '...' : text, W / 2, 18);
+  }
   function drawHud(ctx, W) {
-    if (!cfg.hud || (cfg.enabled && !S.playing)) return;
+    if (!cfg.hud) return;
+    if (cfg.enabled && !S.playing) { if (S.noSelf > 180 && S.ready && !S.dom.menu && !S.dom.dead) drawNote(ctx, W, 'Diep Assist: ' + why()); return; }
     const lines = [];
     const sol = S.sol;
     const st = S.stats;
@@ -2354,6 +2369,19 @@
       save(); applyClean(); refreshAll();
       return n > 0;
     } catch { return false; }
+  }
+  // One-click strengths for hosting a game where the aim is a perk that players unlock in steps.
+  const TIERS = {
+    off: { aim: false, autoFire: false },
+    assist: { aim: true, aimMode: 'near', cone: 20, assist: 45, predict: true, leadScale: 60, dodge: false, human: 70, smooth: 150, reaction: 120, autoFire: false },
+    smart: { aim: true, aimMode: 'firing', assist: 80, predict: true, leadScale: 100, dodge: true, human: 50, smooth: 130, reaction: 90, autoFire: false },
+    full: { aim: true, aimMode: 'always', assist: 100, predict: true, leadScale: 100, dodge: true, human: 40, smooth: 130, reaction: 70 },
+  };
+  function applyTier(name) {
+    const t = TIERS[name];
+    if (!t) return false;
+    Object.assign(cfg, t); save(); refreshAll();
+    return true;
   }
   const PROFILE_KEY = 'diepAssist.v2.profiles';
   const profiles = () => { try { return JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}'); } catch { return {}; } };
@@ -2500,6 +2528,8 @@
 
   function tabAim() {
     return [
+      h('div', { class: 'da-row' }, h('div', { class: 'da-l' }, 'Strength', h('small', null, 'one-click levels, e.g. for an aim perk that unlocks in steps')),
+        ...[['Off', 'off'], ['Assist', 'assist'], ['Smart', 'smart'], ['Full', 'full']].map(([n, k]) => h('button', { class: 'da-btn', onclick: () => { applyTier(k); toast('Aim strength: ' + n); } }, n))),
       rowToggle('aim', 'Auto aim', 'Move the cursor onto enemy tanks'),
       rowSelect('aimMode', 'Activation', [['always', 'Always'], ['firing', 'While I fire (LMB / Space / E)'], ['hold', 'While holding a key'], ['near', 'Assist: tanks near where I point']]),
       rowKey('Hold key', () => cfg.holdKey, (c) => setCfg('holdKey', c)),
@@ -2587,6 +2617,7 @@
         h('button', { class: 'da-btn', onclick: () => toast(saveProfile(n) ? 'Saved to profile ' + n : 'Could not save') }, 'Save'),
         h('button', { class: 'da-btn', onclick: () => toast(loadProfile(n) ? 'Loaded profile ' + n : 'Profile ' + n + ' is empty') }, 'Load'))),
       sec('Session'),
+      h('div', { class: 'da-row' }, h('div', { class: 'da-l', id: 'da-why', style: 'opacity:.8' }, '')),
       h('div', { class: 'da-row' }, h('div', { class: 'da-l', id: 'da-stats' }, ''), h('button', { class: 'da-btn', onclick: () => { S.stats.shots = 0; S.stats.hits = 0; } }, 'reset')),
       h('div', { class: 'da-row' }, h('button', { class: 'da-btn', onclick: () => { try { navigator.clipboard.writeText(JSON.stringify(report(), null, 1)); toast('Diagnostics copied'); } catch { console.log(report()); toast('Diagnostics logged to the console'); } } }, 'Copy diagnostics'),
         h('span', { class: 'da-note', style: 'margin:0' }, 'paste it back when something does not line up')),
@@ -2721,10 +2752,30 @@
     toastTimer = setTimeout(() => { toastEl.style.opacity = '0'; }, 1300);
   }
   let lastStatus = '';
+  // A plain-language answer to "why is nothing happening?"
+  function why() {
+    if (!cfg.enabled) return 'switched off';
+    if (!S.canvas) return 'no game canvas found yet';
+    const f = S.ready;
+    if (!f) return 'waiting for the first frame';
+    if (nowMs() - f.t > 1500) return 'the game is not redrawing';
+    if (S.dom.menu) return 'in the menu';
+    if (S.dom.dead) return 'dead';
+    if (!S.self && !S.playing) {
+      const d = f.diag;
+      if (d && d.circles + d.polys === 0) return 'nothing drawn yet';
+      return `cannot find my tank at the screen centre (${f.tanks.length} tanks, ${f.bullets.length} round, ${f.drones.length} drones, ${f.shapes.length} shapes seen) - Misc > Record 2 frames`;
+    }
+    if (!S.playing) return 'not in game';
+    if (!S.sol) return S.tanks.some((t) => t.seen) ? 'enemies are out of range or filtered out' : 'no enemy on screen';
+    return 'locked on ' + (S.sol.tk.name || '#' + S.sol.tk.id);
+  }
   function refreshPanelStatus() {
     if (!panel || !cfg.ui.open) return;
     const txt = !cfg.enabled ? 'off' : S.playing ? (S.sol ? 'target #' + S.sol.tk.id : 'no target') : 'not in game';
     if (txt !== lastStatus) { lastStatus = txt; statusEl.textContent = txt; dotEl.classList.toggle('on', cfg.enabled && S.playing); }
+    const wy = document.getElementById('da-why');
+    if (wy) { const w = why(); if (wy.textContent !== w) wy.textContent = w; }
     const st = document.getElementById('da-stats');
     if (st) st.textContent = `shots ${S.stats.shots}  hits ${S.stats.hits}  (${S.stats.shots ? Math.round((100 * S.stats.hits) / S.stats.shots) : 0}%)`;
     const tn = document.getElementById('da-tune');
@@ -2843,7 +2894,7 @@
   // Handy for debugging from the console: diepAssist.cfg, diepAssist.S ...
   window.diepAssist = {
     version: VERSION, cfg, S, cam, ctl, bullet, F, applyBuild, scheduleBuild,
-    rank: () => S.rank, report, recordFrames, exportSettings, importSettings, saveProfile, loadProfile,
+    rank: () => S.rank, report, recordFrames, tier: applyTier, why, exportSettings, importSettings, saveProfile, loadProfile,
     get: (key) => cfg[key],
     set: (key, value) => { if (key in cfg && key !== 'keys' && key !== 'ui') setCfg(key, value); }, // e.g. diepAssist.set('aim', true)
   };

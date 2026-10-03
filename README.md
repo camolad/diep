@@ -1,72 +1,108 @@
 # Diep Assist
 
-A Tampermonkey userscript for a **private diep.io-style server you run yourself**: smooth predictive auto-aim,
-auto-fire, ESP, shape farming, an auto-build scheduler and a few quality-of-life tools. It refuses to run on the
-public `diep.io`.
+A Tampermonkey userscript for a **private diep.io-style server you run yourself**: natural-looking predictive auto-aim
+that goes for the right tank, auto-fire, ESP, shape farming, an auto-build scheduler and quality-of-life tools.
+It refuses to run on the public `diep.io` (any `*.diep.io` host) - keep it that way, it is for your own server.
 
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/).
 2. Create a new script and paste in `diep-assist.user.js`.
-3. Edit the `@match` lines at the top so they cover only your server (`localhost` is already there).
+3. Edit the `@match` lines at the top so they cover **only your server** (`localhost` / `127.0.0.1` are already there;
+   replace `YOUR-PRIVATE-SERVER.example`). Tampermonkey injects at `document-start`, which the canvas hooks need.
 4. Open the game. **Insert** shows/hides the menu.
 
 | Default key | Action | | Default key | Action |
 |---|---|---|---|---|
-| `\` | auto aim | | `;` | farm shapes |
-| `[` | auto fire | | `'` | prediction |
-| `]` | ESP | | `Delete` | master switch |
+| `\` | auto aim | | `,` | pin / unpin the current target |
+| `[` | auto fire | | `.` | next target in the ranking |
+| `]` | ESP | | `End` | clean view (hides every overlay and the menu) |
+| `;` | farm shapes | | `Delete` | master switch |
+| `'` | prediction | | `Insert` | menu |
 
-All keys can be rebound in the **Misc** tab.
+Every key can be rebound in the **Misc** tab.
 
 ## What it does
 
-- **Natural lock-on.** The cursor is driven in polar coordinates around your tank through two critically damped
-  followers: a swing starts and ends gently (bell-shaped speed, no snap), always takes the short way round, and
-  carries on at the speed your real mouse had. A short reaction delay and a wait for a usable velocity estimate
-  stop a lock from jerking when a tank first appears. *Lock-on style* presets: Natural / Quick / Instant.
-- **Prediction.** Enemies are tracked in world coordinates (the camera is followed through the background grid
-  and the shapes). Each gets a weighted least-squares position/velocity fit; the aim point is where your bullet
-  and the tank meet, using the bullet flight profile measured from your own shots. Motion is assumed to persist
-  for a limited time (*prediction persistence*), the way real players keep changing course.
-- **Measured latency.** Every bullet leaves in the direction the cursor pointed one loop-latency earlier, so
-  matching a bullet's flight direction against the cursor history measures render + input delay directly
-  (needs a moving cursor, e.g. while tracking). The lead uses the measurement instead of the slider. On the mock
-  arena this took a circling target from 9% hits (latency wrong by 140 ms) to 97%.
-- **Auto fire.** Toggles the game's own auto-fire (`E`) or holds Space, only while locked on, aimed, and the shot
-  is likely to land (confidence, flight time and aim error gates).
-- **Farm mode.** With no enemy in range, aims at the nearest (or most valuable) shape.
-- **Auto build.** Pick how many points go in each stat (or a preset); the script schedules the upgrade order
-  (balanced or one stat at a time), shows a level-by-level timeline, and queues it with the game's
-  `game_stats_build` console command (or, without a console, by holding `U` and pressing the stat keys).
-  *Re-apply on every respawn* keeps it going across lives.
-- **ESP.** Rings, distances, predicted path, aim point, off-screen arrows (also where an enemy that just left
-  the view should be) and incoming-bullet warnings.
-- **Comfort.** Real clicks on the upgrade panels are never aimed away, aim pauses while the pointer is over the
-  menu, auto respawn, and toggles for the game's `ren_fps`, `ren_debug_collisions`, `ren_raw_health_values`,
-  `ren_ui` and `net_predict_movement`.
+**Picks the right tank.** *Who to shoot* (Targets tab): *Smart* (default) weighs who is shooting at you, how strong the tank
+is (score), how hurt it is, and how near; or choose *highest score*, *lowest health*, *whoever shoots at me*, *closest to my
+tank*, *closest to my mouse*. Scores come from the leaderboard (matched to nameplates), health from the health bars (the last
+fraction seen is kept when a bar fades), and a size-based level estimate fills the gaps. *Ignore small fry* skips low-score
+tanks while something much stronger is around - unless the small one is the one fighting you - so a 300-score bot no
+longer steals the lock while you duel a stronger player. A challenger has to stay better for a moment before the lock moves.
+Pin (`,`) or cycle (`.`) to decide yourself; list names under *Never target*.
 
-`window.diepAssist` exposes the live config (`diepAssist.set('aim', true)`, `diepAssist.cfg`, ...) for other code.
+**Natural motion.** The cursor is driven in polar coordinates around your tank through two critically damped followers:
+swings start and end gently (bell-shaped speed, no snap), take the short way round, begin after a short reaction delay, and
+tracking has a slow human wander that stays inside the tank. *Lock-on style* presets: Natural / Quick / Instant; *Assist
+strength* blends with your own mouse; *Assist* activation only helps with tanks near where you point; a hard flick of the real
+mouse takes the barrel back for a moment. `node test/trace.mjs out.png` draws the barrel angle and speed over time.
 
-## If something does not line up on your server
+**Prediction.** Enemies are tracked in world coordinates (the camera is read from the background grid, zoom-safe, and cross-checked
+with shapes); the aim point is where your bullet and the tank meet, using the bullet flight profile and the loop latency
+measured from your own shots. On top of that, each tank has a small learner (*Learn rhythm and dodging*):
+* a **strafing beat** (A/D spam) is detected from direction reversals and projected forward, with the centre of the swing as a
+  second guess; it is scored against plain constant velocity on that very tank, so a tank without a beat gets weight 0;
+* a tank that **dodges your bullets** (sideways velocity change after a bullet appears, tested against the same measurement
+  along the bullet path) gets "dodges / keeps dodging" guesses; the favoured side is recorded but is the weakest part.
 
-Turn on **Visuals → Debug info**. It shows the detected zoom, how the camera is being followed (`grid` /
-`shapes` / `dead`), how many tanks and shapes were recognised and how many shots the latency tuner has seen.
+`bench/RESULTS.md` has the numbers: on simulated opponents, +20 points against beat-strafers and +5 against dodgers, nothing worse
+elsewhere - *simulated*, see "What is verified" below. The status line shows `beat 0.55s` / `dodges 70%` when something was learned.
 
-- Shots land consistently ahead of / behind a moving target: raise / lower *Latency compensation* (or let the
-  tuner work), and try *Bullets inherit my velocity* if it only happens while you strafe.
-- Auto fire does nothing: try the other *Fire method*.
-- Nothing is recognised: the server's client draws differently from the assumptions listed in the header of
-  `diep-assist.user.js`.
+**Strength presets** (Aim tab): Off / Assist / Smart / Full - handy when the aim is a perk that unlocks in steps.
+**Auto fire** toggles the game's own auto-fire (`E`) or holds Space, only while locked on and likely to land.
+**Farm mode** aims at shapes when no enemy is in range. **Auto build** schedules the stat order (`game_stats_build` or `U`+digits).
+**ESP**: rings, distances, predicted path, aim point, off-screen arrows, incoming-bullet warnings, name/score/health labels.
+**Comfort**: safe click zones on the upgrade panels, aim pauses over the menu, auto respawn, settings export/import and
+three profiles, `ren_*` / `net_predict_movement` toggles, a diagnostics report, and a plain-language "why nothing happens" line
+(Misc tab, and on screen when no tank is found).
+
+`window.diepAssist` exposes the config and state (`diepAssist.set('aim', true)`, `.tier('assist')`, `.why()`, `.report()` ...).
+
+## If it does not see your game (read this first)
+
+The drawing of the real client is only partly known. What was recorded from a real frame (`test/fixtures/client-probe-partial.json`):
+one `clearRect` per frame, paths whose points are already in canvas pixels, shapes filled twice then stroked with a darker colour
+under a scaled pen transform, the grid as a 50-unit `CanvasPattern` fill, translucent team bases, small team-coloured triangles.
+**No real frame with a tank body, barrels, text or health bar has been captured yet** - those parts are assumed (a filled and stroked
+circle for a body, grey `#999999` polygons drawn before it for barrels, `fillText` / offscreen text for names, `#85e37d` / `#555555`
+bars for health) and the script has fallbacks (a round object at the screen centre is taken as your tank).
+
+If the status says it cannot find your tank:
+1. Spawn into the game with a tank on screen and some other tank or the leaderboard visible.
+2. **Misc -> Record 2 frames to a file.** It saves *every* canvas call of two complete frames, including the offscreen canvases
+   the game draws into, with only the changed state per call.
+3. Replay it offline with `node test/replay.mjs diep-frames-*.json` (prints what the script made of it), or send the file to
+   whoever maintains the script. `node test/replay-check.mjs` replays the fixtures and a recorder round trip.
+
+Other knobs: *Visuals -> Debug info* (zoom, camera source, counts), *Latency compensation* (used until measured), *Bullets
+inherit my velocity* (if shots miss only while you strafe), the other *Fire method* if auto fire does nothing.
+
+## What is verified (and what is not)
+
+* **Real data:** the recorded frame above replays without errors; the grid (zoom 0.406, 50-unit tile), the ignored translucent
+  bases and the 30 small polygons are read as expected (`test/replay-check.mjs`).
+* **Mock arena (my own, not real):** `test/mock-diep.html` draws in three styles (`real` = the recorded path style, `xform`, `legacy`),
+  optionally with text in offscreen canvases, circles as polygons, drones, a breathing zoom and a rough network. Feature checks
+  (`features.mjs` 28, `features2.mjs` 32) pass in every style.
+* **Benchmark opponents (my own, not real):** `bench/` - see `bench/RESULTS.md`.
+* **Not verified:** anything involving a real tank/barrel/text/health-bar frame, real server timing, or real players' dodging.
 
 ## Tests (no game server needed)
 
-`test/mock-diep.html` is a small stand-in arena that draws the way the script expects (grey barrels then a
-border + body circle, polygon shapes, a wrapped grid pattern, 30 Hz snapshots with render and input delay).
-
 ```
 npm install && npx playwright install chromium
-npm test                  # feature checks: hotkeys, build, auto-fire, farm, safe zones, flash, diep.io guard ...
-node test/run.mjs         # hit rate + smoothness matrix (add --baseline old.js to compare versions)
-node test/lockon.mjs      # lock-on speed / acceleration / jerk (add label=old.js to compare versions)
+npm test                       # features.mjs + features2.mjs + replay-check.mjs
+node test/run.mjs              # hit-rate + smoothness matrix (--baseline old.js to compare)
+node test/lockon.mjs           # lock-on speed / acceleration / jerk
+node test/trace.mjs out.png    # barrel angle + speed plot
+node test/ab.mjs               # prediction learner on / off in the mock
+node bench/sweep.mjs adaptive mild 16 100   # predictor benchmark
 ```
+`DIEP_SCRIPT=path/to/script.js` picks the script under test and `DIEP_QUERY="style=xform&textmode=offscreen"` the mock's draw style.
+
+## Layout
+
+`diep-assist.user.js` the script (one file, sections 1-16 - hooks, world model, aim solver, cursor control, build, UI) -
+`bench/` predictor benchmark and the learner's source of truth (`predictors/adaptive.mjs`, embedded by `work/embed_pred.py`) -
+`test/` mock arena, tests, recorded fixtures - `work/` small helper code and experiments.
