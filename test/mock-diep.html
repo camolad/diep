@@ -1,0 +1,289 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mock diep arena (for testing diep-assist.user.js)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #cdcdcd; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+/*
+ * A tiny stand-in for the diep.io client + server, good enough to exercise the userscript offline.
+ *
+ * It copies what the script relies on, not the real game's art:
+ *   - one full-canvas clearRect per frame, grid drawn with a CanvasPattern whose offset wraps
+ *   - tank = grey barrel polygon, then a border circle and a body circle (same centre)
+ *   - bullet = border circle + body circle with no grey part; shapes = filled polygons in the four shape colours
+ *   - mousemove (real or synthetic) on window sets the aim; mouse buttons only count when trusted; E toggles auto-fire
+ *   - server runs at 30 Hz; other entities are drawn `renderDelay` seconds in the past, mouse input reaches the
+ *     server `inputDelay` seconds late, the mouse is a WORLD position (converted with the camera when the event fires)
+ *
+ * URL parameters: pattern=still|linear|circle|strafe  rd=0.06  id=0.06  inherit=1  zoom=0.8  bs=900  efire=1
+ *                 shapes=40  wrap=0  seed=1  console=0
+ */
+(() => {
+  const q = new URLSearchParams(location.search);
+  const num = (k, d) => (q.has(k) ? +q.get(k) : d);
+  const P = {
+    pattern: q.get('pattern') || 'strafe',
+    renderDelay: num('rd', 0.06),
+    inputDelay: num('id', 0.06),
+    inherit: q.get('inherit') === '1',
+    zoom: num('zoom', 0.8),
+    bulletSpeed: num('bs', 900),
+    enemyFire: q.get('efire') === '1',
+    shapes: num('shapes', 40),
+    wrapGrid: q.get('wrap') !== '0',
+    seed: num('seed', 1),
+    console: q.get('console') !== '0',
+    tick: 1 / 30,
+  };
+
+  function mulberry32(a) {
+    return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  const rnd = mulberry32(P.seed * 7919 + 13);
+
+  const cv = document.getElementById('canvas');
+  const ctx = cv.getContext('2d');
+  function resize() { cv.width = innerWidth; cv.height = innerHeight; }
+  addEventListener('resize', resize); resize();
+
+  const R = 50, BR = 15;
+  const COL = {
+    me: ['#00b2e1', '#0085a8'], foe: ['#f14e54', '#b43a3f'],
+  };
+  const FLASH = ['#eef9fc', '#cfe4ea'], FLASH_FOE = ['#fdeeee', '#ecd0d0'];
+  let flashPlayerUntil = 0, flashFoeUntil = 0;
+  const SHAPE = [['#ffe869', '#bfae4e', 4], ['#fc7677', '#bd5959', 3], ['#768dfc', '#5a6abd', 5]];
+
+  const player = { x: 0, y: 0, vx: 0, vy: 0, angle: 0 };
+  const keys = {};
+  let autoFire = false, mouseHold = false, spaceHold = false, uHeld = false;
+  let simT = 0, nextShot = 0, nextTick = 0, idSeq = 1;
+  const enemies = [], bullets = [], shapes = [], inputs = [], snaps = [];
+  const stats = { fired: 0, hits: 0, expired: 0, statKeys: [], console: [], eToggles: 0, frames: 0, synthMouseDown: 0 };
+  const barrel = []; // [simT, angle] per rendered frame
+  if (P.console) window.input = { execute: (c) => { stats.console.push(c); } };
+
+  function makeEnemies() {
+    enemies.length = 0;
+    const e = { id: idSeq++, x: 0, y: 0, vx: 0, vy: 0, angle: 0, nextTurn: 0, phase: 0, hp: 0 };
+    if (P.pattern === 'still') { e.x = 420; e.y = -140; }
+    else if (P.pattern === 'linear') { e.x = 380; e.y = -300; e.vy = 230; }
+    else if (P.pattern === 'circle') { e.x = 330; e.y = 0; }
+    else { e.x = 400; e.y = 100; }
+    e.pattern = P.pattern;
+    enemies.push(e);
+  }
+  function makeShapes() {
+    shapes.length = 0;
+    for (let i = 0; i < P.shapes; i++) {
+      const k = SHAPE[Math.floor(rnd() * 3)];
+      shapes.push({ x: (rnd() - 0.5) * 5000, y: (rnd() - 0.5) * 4000, a: rnd() * 6.28, w: (rnd() - 0.5) * 0.6, vx: (rnd() - 0.5) * 6, vy: (rnd() - 0.5) * 6, k, r: 30 + rnd() * 20 });
+    }
+  }
+  makeEnemies(); makeShapes();
+
+  /* ---------------- input ---------------- */
+  addEventListener('mousemove', (e) => {
+    inputs.push({ t: simT, wx: player.x + (e.clientX - cv.width / 2) / P.zoom, wy: player.y + (e.clientY - cv.height / 2) / P.zoom });
+    if (inputs.length > 400) inputs.shift();
+  });
+  addEventListener('mousedown', (e) => { if (!e.isTrusted) { stats.synthMouseDown++; return; } if (e.button === 0) mouseHold = true; });
+  addEventListener('mouseup', (e) => { if (e.isTrusted && e.button === 0) mouseHold = false; });
+  addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'KeyE' && !e.repeat) { autoFire = !autoFire; stats.eToggles++; }
+    if (e.code === 'Space') spaceHold = true;
+    if (e.code === 'KeyU') uHeld = true;
+    if (/^Digit[1-8]$/.test(e.code)) stats.statKeys.push({ key: e.code.slice(5), withU: uHeld });
+  });
+  addEventListener('keyup', (e) => { keys[e.code] = false; if (e.code === 'Space') spaceHold = false; if (e.code === 'KeyU') uHeld = false; });
+
+  /* ---------------- server simulation ---------------- */
+  function latestInput(t) {
+    let best = null;
+    for (const i of inputs) { if (i.t <= t) best = i; else break; }
+    return best || inputs[0] || null;
+  }
+
+  function stepEnemy(e, dt) {
+    if (e.pattern === 'drift') { e.x += e.vx * dt; e.y += e.vy * dt; }
+    else if (e.pattern === 'linear') {
+      e.y += e.vy * dt;
+      if (e.y > 380) { e.y = 380; e.vy = -Math.abs(e.vy); } else if (e.y < -380) { e.y = -380; e.vy = Math.abs(e.vy); }
+    } else if (e.pattern === 'circle') {
+      e.phase += 0.9 * dt;
+      const nx = Math.cos(e.phase) * 330, ny = Math.sin(e.phase) * 330;
+      e.vx = (nx - e.x) / dt; e.vy = (ny - e.y) / dt; e.x = nx; e.y = ny;
+    } else if (e.pattern === 'strafe') {
+      if (simT >= e.nextTurn) {
+        const a = rnd() * Math.PI * 2, s = 140 + rnd() * 140;
+        e.tvx = Math.cos(a) * s; e.tvy = Math.sin(a) * s; e.nextTurn = simT + 0.4 + rnd() * 0.8;
+      }
+      const ax = e.tvx - e.vx, ay = e.tvy - e.vy, am = Math.hypot(ax, ay) || 1, step = Math.min(am, 1500 * dt);
+      e.vx += (ax / am) * step; e.vy += (ay / am) * step;
+      e.x += e.vx * dt; e.y += e.vy * dt;
+      if (e.x > 700) { e.x = 700; e.vx = -Math.abs(e.vx); e.tvx = -Math.abs(e.tvx); }
+      if (e.x < -700) { e.x = -700; e.vx = Math.abs(e.vx); e.tvx = Math.abs(e.tvx); }
+      if (e.y > 380) { e.y = 380; e.vy = -Math.abs(e.vy); e.tvy = -Math.abs(e.tvy); }
+      if (e.y < -380) { e.y = -380; e.vy = Math.abs(e.vy); e.tvy = Math.abs(e.tvy); }
+    }
+    e.angle = Math.atan2(player.y - e.y, player.x - e.x);
+  }
+
+  function spawnBullet(owner, x, y, ang, speed, inherit) {
+    bullets.push({ id: idSeq++, owner, x, y, ang, age: 0, speed, ivx: inherit ? player.vx : 0, ivy: inherit ? player.vy : 0 });
+  }
+
+  function step(dt) {
+    simT += dt;
+    // player
+    const ax = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+    const ay = (keys.KeyS || keys.ArrowDown ? 1 : 0) - (keys.KeyW || keys.ArrowUp ? 1 : 0);
+    const am = Math.hypot(ax, ay) || 1;
+    player.vx += (ax / am) * 1800 * dt; player.vy += (ay / am) * 1800 * dt;
+    const f = Math.exp(-4 * dt); player.vx *= f; player.vy *= f;
+    const sp = Math.hypot(player.vx, player.vy);
+    if (sp > 330) { player.vx *= 330 / sp; player.vy *= 330 / sp; }
+    player.x += player.vx * dt; player.y += player.vy * dt;
+    const inp = latestInput(simT - P.inputDelay);
+    if (inp) player.angle = Math.atan2(inp.wy - player.y, inp.wx - player.x);
+    // fire
+    if ((autoFire || mouseHold || spaceHold) && simT >= nextShot) {
+      nextShot = simT + 0.25;
+      const m = R * 1.7;
+      spawnBullet('me', player.x + Math.cos(player.angle) * m, player.y + Math.sin(player.angle) * m, player.angle, P.bulletSpeed, P.inherit);
+      stats.fired++;
+    }
+    // enemies
+    for (const e of enemies) {
+      stepEnemy(e, dt);
+      if (P.enemyFire && simT >= (e.nextShot || 0)) {
+        e.nextShot = simT + 0.7;
+        spawnBullet('foe', e.x + Math.cos(e.angle) * R * 1.7, e.y + Math.sin(e.angle) * R * 1.7, e.angle, 650, false);
+      }
+    }
+    // bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      b.age += dt;
+      const s = b.speed * (1 - 0.55 * Math.exp(-b.age / 0.12));
+      b.x += (Math.cos(b.ang) * s + b.ivx) * dt; b.y += (Math.sin(b.ang) * s + b.ivy) * dt;
+      let dead = b.age > 2.0;
+      if (b.owner === 'me') {
+        for (const e of enemies) if (Math.hypot(b.x - e.x, b.y - e.y) < R + BR) { stats.hits++; e.hp++; dead = true; break; }
+      }
+      if (dead && b.owner === 'me' && b.age > 2.0) stats.expired++;
+      if (dead) bullets.splice(i, 1);
+    }
+    for (const s of shapes) { s.a += s.w * dt; s.x += s.vx * dt; s.y += s.vy * dt; }
+    // snapshot at server rate
+    if (simT >= nextTick) {
+      nextTick = simT + P.tick;
+      snaps.push({ t: simT, e: enemies.map((e) => ({ id: e.id, x: e.x, y: e.y, angle: e.angle })), b: bullets.map((b) => ({ id: b.id, owner: b.owner, x: b.x, y: b.y })) });
+      while (snaps.length > 40) snaps.shift();
+    }
+  }
+
+  // linear interpolation of the snapshot buffer at time tq
+  function sample(tq) {
+    let a = snaps[0], b = snaps[0];
+    for (let i = 0; i < snaps.length; i++) { if (snaps[i].t <= tq) a = snaps[i]; if (snaps[i].t >= tq) { b = snaps[i]; break; } b = snaps[i]; }
+    if (!a) return { e: [], b: [] };
+    const k = b.t > a.t ? Math.min(1, Math.max(0, (tq - a.t) / (b.t - a.t))) : 0;
+    const mix = (list, ref) => list.map((o) => {
+      const p = ref.find((r) => r.id === o.id);
+      return p ? { ...o, x: o.x + (p.x - o.x) * k, y: o.y + (p.y - o.y) * k, angle: o.angle !== undefined ? o.angle + wrap((p.angle ?? o.angle) - o.angle) * k : undefined } : o;
+    });
+    return { e: mix(a.e, b.e), b: mix(a.b, b.b) };
+  }
+  const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+
+  /* ---------------- rendering ---------------- */
+  const tile = document.createElement('canvas');
+  tile.width = 50; tile.height = 50;
+  { const t = tile.getContext('2d'); t.fillStyle = '#cdcdcd'; t.fillRect(0, 0, 50, 50); t.strokeStyle = '#c4c4c4'; t.lineWidth = 2; t.strokeRect(0, 0, 50, 50); }
+  const gridPattern = ctx.createPattern(tile, 'repeat');
+
+  function poly(x, y, r, n, rot) {
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const a = rot + (i * 2 * Math.PI) / n;
+      if (i === 0) ctx.moveTo(x + Math.cos(a) * r, y + Math.sin(a) * r); else ctx.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
+    }
+    ctx.closePath();
+  }
+  function drawShape(s) {
+    const [fill, border, n] = s.k;
+    poly(s.x, s.y, s.r, n, s.a); ctx.fillStyle = border; ctx.fill();
+    poly(s.x, s.y, s.r - 5, n, s.a); ctx.fillStyle = fill; ctx.fill();
+  }
+  function drawBullet(x, y, col) {
+    ctx.beginPath(); ctx.arc(x, y, BR, 0, Math.PI * 2); ctx.fillStyle = col[1]; ctx.fill();
+    ctx.beginPath(); ctx.arc(x, y, BR - 3, 0, Math.PI * 2); ctx.fillStyle = col[0]; ctx.fill();
+  }
+  function drawTank(x, y, ang, col) {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
+    ctx.beginPath(); ctx.moveTo(0, -17); ctx.lineTo(R * 1.9, -17); ctx.lineTo(R * 1.9, 17); ctx.lineTo(0, 17); ctx.closePath();
+    ctx.fillStyle = '#999999'; ctx.fill(); ctx.strokeStyle = '#727272'; ctx.lineWidth = 4; ctx.stroke();
+    ctx.restore();
+    ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI * 2); ctx.fillStyle = col[1]; ctx.fill();
+    ctx.beginPath(); ctx.arc(x, y, R - 4, 0, Math.PI * 2); ctx.fillStyle = col[0]; ctx.fill();
+  }
+
+  function render() {
+    const W = cv.width, H = cv.height, Z = P.zoom;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#cdcdcd'; ctx.fillRect(0, 0, W, H);
+    // grid pattern; its offset is wrapped like a scrolling texture
+    const cell = 50 * Z;
+    let e = W / 2 - player.x * Z, f = H / 2 - player.y * Z;
+    if (P.wrapGrid) { e = ((e % cell) + cell) % cell; f = ((f % cell) + cell) % cell; }
+    ctx.setTransform(Z, 0, 0, Z, e, f);
+    ctx.fillStyle = gridPattern; ctx.fillRect(-120, -120, W / Z + 240, H / Z + 240);
+    ctx.setTransform(Z, 0, 0, Z, W / 2 - player.x * Z, H / 2 - player.y * Z);
+    for (const s of shapes) drawShape(s);
+    const snap = sample(simT - P.renderDelay);
+    for (const b of snap.b) drawBullet(b.x, b.y, b.owner === 'me' ? COL.me : COL.foe);
+    const nowT = performance.now();
+    for (const en of snap.e) drawTank(en.x, en.y, en.angle, nowT < flashFoeUntil ? FLASH_FOE : COL.foe);
+    drawTank(player.x, player.y, player.angle, nowT < flashPlayerUntil ? FLASH : COL.me);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    let dt = Math.min((now - last) / 1000, 0.1); last = now;
+    while (dt > 0) { const d = Math.min(dt, 1 / 120); step(d); dt -= d; }
+    barrel.push([simT, player.angle]);
+    if (barrel.length > 20000) barrel.shift();
+    stats.frames++;
+    render();
+  }
+  requestAnimationFrame(frame);
+
+  window.__mock = {
+    P, stats, barrel, player, enemies, bullets,
+    resetStats() { stats.fired = 0; stats.hits = 0; stats.expired = 0; stats.eToggles = 0; stats.frames = 0; barrel.length = 0; },
+    setPattern(p) { P.pattern = p; makeEnemies(); },
+    simT: () => simT,
+    flashPlayer(ms) { flashPlayerUntil = performance.now() + ms; },
+    flashEnemies(ms) { flashFoeUntil = performance.now() + ms; },
+    addEnemy(spec) { const e = Object.assign({ id: idSeq++, x: 0, y: 0, vx: 0, vy: 0, angle: 0, nextTurn: 0, phase: 0, hp: 0, pattern: 'still' }, spec); enemies.push(e); return e.id; },
+    removeEnemy(id) { const i = enemies.findIndex((e) => e.id === id); if (i >= 0) enemies.splice(i, 1); },
+    clearEnemies() { enemies.length = 0; },
+    get autoFire() { return autoFire; },
+    state() { return { simT, player: { ...player }, enemies: enemies.map((e) => ({ ...e })), autoFire, mouseHold, spaceHold }; },
+  };
+})();
+</script>
+</body>
+</html>
