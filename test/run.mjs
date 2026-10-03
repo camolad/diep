@@ -94,7 +94,7 @@ async function scenario({ label, script, pattern, move, fire, cfg = {}, query = 
 export { scenario, browser, port, server };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const script = path.join(root, 'diep-assist.user.js');
+  const script = process.env.DIEP_SCRIPT ? path.resolve(process.env.DIEP_SCRIPT) : path.join(root, 'diep-assist.user.js');
   const rows = [];
   const patterns = only ? [only] : ['still', 'linear', 'circle', 'strafe'];
   const moves = onlyMove ? [onlyMove] : ['stand', 'strafe'];

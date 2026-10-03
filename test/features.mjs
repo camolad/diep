@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const SCRIPT = path.resolve(here, '..', 'diep-assist.user.js');
+const SCRIPT = process.env.DIEP_SCRIPT ? path.resolve(process.env.DIEP_SCRIPT) : path.resolve(here, '..', 'diep-assist.user.js');
 const args = process.argv.slice(2);
 const shotsDir = args.includes('--shots') ? args[args.indexOf('--shots') + 1] : null;
 
@@ -28,9 +28,10 @@ async function open(query = 'pattern=still', cfg = {}, opts = {}) {
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
-  await page.addInitScript((c) => { try { localStorage.setItem('diepAssist.v2', JSON.stringify(c)); } catch (e) { /* ignore */ } }, cfg);
+  // precision checks run without the deliberate human wander unless a test asks for it
+  await page.addInitScript((c) => { try { localStorage.setItem('diepAssist.v2', JSON.stringify(c)); } catch (e) { /* ignore */ } }, { human: 0, ...cfg });
   await page.addInitScript({ path: SCRIPT });
-  await page.goto(`http://localhost:${port}/mock-diep.html?${query}`);
+  await page.goto(`http://localhost:${port}/mock-diep.html?${query}${process.env.DIEP_QUERY ? '&' + process.env.DIEP_QUERY : ''}`);
   return { page, ctx, errors };
 }
 const angleTo = (st, e) => Math.atan2(e.y - st.player.y, e.x - st.player.x);

@@ -22,8 +22,24 @@
  *   - server runs at 30 Hz; other entities are drawn `renderDelay` seconds in the past, mouse input reaches the
  *     server `inputDelay` seconds late, the mouse is a WORLD position (converted with the camera when the event fires)
  *
- * URL parameters: pattern=still|linear|circle|strafe  rd=0.06  id=0.06  inherit=1  zoom=0.8  bs=900  efire=1
+ * URL parameters: pattern=still|linear|circle|strafe|periodic  rd=0.06  id=0.06  inherit=1  zoom=0.8  bs=900  efire=1
  *                 shapes=40  wrap=0  seed=1  console=0
+ *                 net=clean|jitter|rough   irregular snapshot cadence / ~150 ms packet hitches (the drawn tank freezes, then jumps)
+ *                 noise=1.5                 gaussian noise (world units) on the drawn position of other tanks
+ *                 dodge=reactive            enemies sidestep the player's bullets after a reaction time (bias=0.8 favourite side share)
+ *                 lvl=1                     the player's level (tank radius = 50 * 1.01^(level-1))
+ *                 text=0                    do not draw names / leaderboard / health bars
+ *                 textmode=offscreen        names / leaderboard rows are rendered into small offscreen canvases and blitted with drawImage
+ *                 style=real|xform|legacy   how paths are built (see "rendering"): real = points pre-transformed to canvas px, filled twice,
+ *                                           outline stroked under a rotated pen transform (what the recorded client does for shapes);
+ *                                           xform = path built under the camera transform, one fill + one darker stroke;
+ *                                           legacy = border circle + body circle (two fills)
+ *                 zoomanim=1                the zoom breathes +-10 % every few seconds (level-up FOV change)
+ *                 drones=4                  every enemy keeps this many triangular drones orbiting it
+ *                 score=3000                my score (default: the middle of my level's range)
+ * Enemies (addEnemy spec): name, level, score, hp, pattern, shoot, dodge:{bias,fav,react,speed}, half (periodic half-period, s)
+ * Drawn like the real client is assumed to: name above each tank (fillText), health bar below a damaged tank (round-capped stroke,
+ * #555555 back + #85e37d fill), leaderboard rows "Name - 12.3k" on the right (fillText), own "Score: 1.2k" and "Lvl N Tank" at the bottom.
  */
 (() => {
   const q = new URLSearchParams(location.search);
@@ -38,6 +54,16 @@
     enemyFire: q.get('efire') === '1',
     shapes: num('shapes', 40),
     wrapGrid: q.get('wrap') !== '0',
+    net: q.get('net') || 'clean',
+    noise: num('noise', 0),
+    dodge: q.get('dodge') || '',
+    bias: num('bias', 0.8),
+    lvl: num('lvl', 1),
+    text: q.get('text') !== '0',
+    textmode: q.get('textmode') || 'direct',
+    style: q.get('style') || 'real',
+    zoomanim: q.get('zoomanim') === '1',
+    drones: num('drones', 0),
     seed: num('seed', 1),
     console: q.get('console') !== '0',
     tick: 1 / 30,
@@ -53,7 +79,16 @@
   function resize() { cv.width = innerWidth; cv.height = innerHeight; }
   addEventListener('resize', resize); resize();
 
-  const R = 50, BR = 15;
+  const BR = 15;
+  const PR = 50 * Math.pow(1.01, P.lvl - 1);          // the player's tank radius
+  const radiusOf = (level) => 50 * Math.pow(1.01, level - 1);
+  const fmtScore = (n) => (n < 1000 ? String(Math.round(n)) : n < 1e6 ? (n / 1000).toFixed(1) + 'k' : (n / 1e6).toFixed(1) + 'm');
+  const nrnd = mulberry32(P.seed * 31 + 7), grnd = mulberry32(P.seed * 131 + 3);
+  const gauss = () => Math.sqrt(-2 * Math.log(1 - grnd())) * Math.cos(2 * Math.PI * grnd());
+  const LEVEL_MIN = [0, 4, 13, 28, 50, 78, 113, 157, 211, 275, 350, 437, 538, 655, 787, 948, 1109, 1301, 1516, 1767, 2026, 2325, 2647, 3035, 3433, 3883, 4379, 4925, 5525, 6184, 6907, 7698, 8537, 9426, 10368, 11367, 12426, 13549, 14739, 16000, 17337, 18754, 20256, 21849, 23536];
+  const levelOfScore = (sc) => { let L = 1; for (let i = 0; i < LEVEL_MIN.length; i++) if (sc >= LEVEL_MIN[i]) L = i + 1; return L; };
+  const scoreOfLvl = (L) => { const lo = LEVEL_MIN[L - 1], hi = L < 45 ? LEVEL_MIN[L] : lo * 1.25; return Math.round(Math.sqrt((lo + 1) * (hi + 1))); };
+  const myScore = q.has('score') ? +q.get('score') : scoreOfLvl(P.lvl);
   const COL = {
     me: ['#00b2e1', '#0085a8'], foe: ['#f14e54', '#b43a3f'],
   };
@@ -64,20 +99,29 @@
   const player = { x: 0, y: 0, vx: 0, vy: 0, angle: 0 };
   const keys = {};
   let autoFire = false, mouseHold = false, spaceHold = false, uHeld = false;
-  let simT = 0, nextShot = 0, nextTick = 0, idSeq = 1;
+  let simT = 0, nextShot = 0, nextTick = 0, idSeq = 1, hitchUntil = -1, nextHitch = 3;
   const enemies = [], bullets = [], shapes = [], inputs = [], snaps = [];
   const stats = { fired: 0, hits: 0, expired: 0, statKeys: [], console: [], eToggles: 0, frames: 0, synthMouseDown: 0 };
   const barrel = []; // [simT, angle] per rendered frame
+  let ZCUR = P.zoom;
   if (P.console) window.input = { execute: (c) => { stats.console.push(c); } };
 
+  function newEnemy(spec) {
+    if (spec && spec.score !== undefined) spec = Object.assign({}, spec, { level: levelOfScore(spec.score) });
+    else if (spec && spec.level !== undefined) spec = Object.assign({}, spec, { score: scoreOfLvl(spec.level) });
+    const e = Object.assign({ id: idSeq++, name: 'Rival', level: 1, score: scoreOfLvl(1), hp: 1, x: 0, y: 0, vx: 0, vy: 0, angle: 0, nextTurn: 0, phase: 0, hits: 0, kills: 0, pattern: 'still', shoot: false, half: 0.55 }, spec);
+    e.r = radiusOf(e.level);
+    if (!e.dodge && P.dodge === 'reactive') e.dodge = { bias: P.bias, fav: 1, react: 0.22, speed: 280 };
+    if (e.dodge) Object.assign(e, { threatSince: null, dodgeUntil: 0, cooldownUntil: 0, dv: null });
+    return e;
+  }
   function makeEnemies() {
     enemies.length = 0;
-    const e = { id: idSeq++, x: 0, y: 0, vx: 0, vy: 0, angle: 0, nextTurn: 0, phase: 0, hp: 0 };
+    const e = newEnemy({ pattern: P.pattern });
     if (P.pattern === 'still') { e.x = 420; e.y = -140; }
     else if (P.pattern === 'linear') { e.x = 380; e.y = -300; e.vy = 230; }
     else if (P.pattern === 'circle') { e.x = 330; e.y = 0; }
     else { e.x = 400; e.y = 100; }
-    e.pattern = P.pattern;
     enemies.push(e);
   }
   function makeShapes() {
@@ -91,7 +135,7 @@
 
   /* ---------------- input ---------------- */
   addEventListener('mousemove', (e) => {
-    inputs.push({ t: simT, wx: player.x + (e.clientX - cv.width / 2) / P.zoom, wy: player.y + (e.clientY - cv.height / 2) / P.zoom });
+    inputs.push({ t: simT, wx: player.x + (e.clientX - cv.width / 2) / ZCUR, wy: player.y + (e.clientY - cv.height / 2) / ZCUR });
     if (inputs.length > 400) inputs.shift();
   });
   addEventListener('mousedown', (e) => { if (!e.isTrusted) { stats.synthMouseDown++; return; } if (e.button === 0) mouseHold = true; });
@@ -112,8 +156,48 @@
     return best || inputs[0] || null;
   }
 
+  function accelTo(e, tvx, tvy, dt, a) {
+    const ax = tvx - e.vx, ay = tvy - e.vy, am = Math.hypot(ax, ay) || 1, step = Math.min(am, a * dt);
+    e.vx += (ax / am) * step; e.vy += (ay / am) * step;
+  }
+  function reactiveVelocity(e) {
+    // sidestep the player's bullets after a reaction time, mostly towards a favourite side
+    if (simT < e.dodgeUntil) return e.dv;
+    let best = null;
+    for (const b of bullets) {
+      if (b.owner !== 'me') continue;
+      const s = b.speed * (1 - 0.55 * Math.exp(-b.age / 0.12)), bvx = Math.cos(b.ang) * s, bvy = Math.sin(b.ang) * s;
+      const rx = e.x - b.x, ry = e.y - b.y, vx = bvx - e.vx, vy = bvy - e.vy, vv = vx * vx + vy * vy;
+      if (vv < 1) continue;
+      const tc = (rx * vx + ry * vy) / vv;
+      if (tc < 0.05 || tc > 1.1) continue;
+      const d = Math.hypot(rx - vx * tc, ry - vy * tc);
+      if (d < 160 && (!best || tc < best.tc)) best = { tc, bvx, bvy };
+    }
+    if (best && simT >= e.cooldownUntil) {
+      if (e.threatSince === null) e.threatSince = simT;
+      if (simT - e.threatSince >= e.dodge.react) {
+        const sp = Math.hypot(best.bvx, best.bvy) || 1, px = -best.bvy / sp, py = best.bvx / sp;
+        const side = nrnd() < e.dodge.bias ? e.dodge.fav : -e.dodge.fav;
+        e.dv = { x: px * side * e.dodge.speed, y: py * side * e.dodge.speed };
+        e.dodgeUntil = simT + 0.35 + nrnd() * 0.35; e.cooldownUntil = e.dodgeUntil + 0.3; e.threatSince = null;
+        return e.dv;
+      }
+    } else e.threatSince = null;
+    return null;
+  }
+
   function stepEnemy(e, dt) {
-    if (e.pattern === 'drift') { e.x += e.vx * dt; e.y += e.vy * dt; }
+    const rv = e.dodge ? reactiveVelocity(e) : null;
+    if (rv) { accelTo(e, rv.x, rv.y, dt, 2000); e.x += e.vx * dt; e.y += e.vy * dt; }
+    else if (e.pattern === 'periodic') {
+      if (e.axis === undefined) { e.axis = nrnd() * Math.PI * 2; e.sign = 1; e.nextFlip = 0; }
+      if (simT >= e.nextFlip) { e.sign = -e.sign; e.nextFlip = simT + e.half * (0.88 + nrnd() * 0.24); }
+      accelTo(e, Math.cos(e.axis) * 250 * e.sign, Math.sin(e.axis) * 250 * e.sign, dt, 1800);
+      e.x += e.vx * dt; e.y += e.vy * dt;
+      if (Math.abs(e.x) > 700) { e.x = Math.sign(e.x) * 700; e.sign = -e.sign; }
+      if (Math.abs(e.y) > 380) { e.y = Math.sign(e.y) * 380; e.sign = -e.sign; }
+    } else if (e.pattern === 'drift') { e.x += e.vx * dt; e.y += e.vy * dt; }
     else if (e.pattern === 'linear') {
       e.y += e.vy * dt;
       if (e.y > 380) { e.y = 380; e.vy = -Math.abs(e.vy); } else if (e.y < -380) { e.y = -380; e.vy = Math.abs(e.vy); }
@@ -157,16 +241,17 @@
     // fire
     if ((autoFire || mouseHold || spaceHold) && simT >= nextShot) {
       nextShot = simT + 0.25;
-      const m = R * 1.7;
+      const m = PR * 1.7;
       spawnBullet('me', player.x + Math.cos(player.angle) * m, player.y + Math.sin(player.angle) * m, player.angle, P.bulletSpeed, P.inherit);
       stats.fired++;
     }
     // enemies
     for (const e of enemies) {
       stepEnemy(e, dt);
-      if (P.enemyFire && simT >= (e.nextShot || 0)) {
+      if ((P.enemyFire || e.shoot) && simT >= (e.nextShot || 0)) {
         e.nextShot = simT + 0.7;
-        spawnBullet('foe', e.x + Math.cos(e.angle) * R * 1.7, e.y + Math.sin(e.angle) * R * 1.7, e.angle, 650, false);
+        const spread = e.shoot ? (nrnd() - 0.5) * 0.12 : 0;
+        spawnBullet('foe', e.x + Math.cos(e.angle) * e.r * 1.7, e.y + Math.sin(e.angle) * e.r * 1.7, e.angle + spread, 650, false);
       }
     }
     // bullets
@@ -177,7 +262,7 @@
       b.x += (Math.cos(b.ang) * s + b.ivx) * dt; b.y += (Math.sin(b.ang) * s + b.ivy) * dt;
       let dead = b.age > 2.0;
       if (b.owner === 'me') {
-        for (const e of enemies) if (Math.hypot(b.x - e.x, b.y - e.y) < R + BR) { stats.hits++; e.hp++; dead = true; break; }
+        for (const e of enemies) if (Math.hypot(b.x - e.x, b.y - e.y) < e.r + BR) { stats.hits++; e.hits++; e.hp -= 0.04; if (e.hp <= 0) { e.hp = 1; e.kills++; stats.kills = (stats.kills || 0) + 1; } dead = true; break; }
       }
       if (dead && b.owner === 'me' && b.age > 2.0) stats.expired++;
       if (dead) bullets.splice(i, 1);
@@ -185,9 +270,13 @@
     for (const s of shapes) { s.a += s.w * dt; s.x += s.vx * dt; s.y += s.vy * dt; }
     // snapshot at server rate
     if (simT >= nextTick) {
-      nextTick = simT + P.tick;
-      snaps.push({ t: simT, e: enemies.map((e) => ({ id: e.id, x: e.x, y: e.y, angle: e.angle })), b: bullets.map((b) => ({ id: b.id, owner: b.owner, x: b.x, y: b.y })) });
-      while (snaps.length > 40) snaps.shift();
+      nextTick = simT + P.tick * (P.net === 'clean' ? 1 : 1 + (nrnd() - 0.5) * 0.7);
+      if (P.net === 'rough' && hitchUntil < 0 && simT >= nextHitch) { hitchUntil = simT + 0.11 + nrnd() * 0.08; nextHitch = simT + 2.5 + nrnd() * 3; }
+      if (hitchUntil >= 0 && simT >= hitchUntil) hitchUntil = -1;
+      if (hitchUntil < 0) { // during a hitch the packet is lost / late
+        snaps.push({ t: simT, e: enemies.map((e) => ({ id: e.id, x: e.x, y: e.y, angle: e.angle, r: e.r, name: e.name, hp: e.hp, score: e.score })), b: bullets.map((b) => ({ id: b.id, owner: b.owner, x: b.x, y: b.y })) });
+        while (snaps.length > 40) snaps.shift();
+      }
     }
   }
 
@@ -211,34 +300,160 @@
   { const t = tile.getContext('2d'); t.fillStyle = '#cdcdcd'; t.fillRect(0, 0, 50, 50); t.strokeStyle = '#c4c4c4'; t.lineWidth = 2; t.strokeRect(0, 0, 50, 50); }
   const gridPattern = ctx.createPattern(tile, 'repeat');
 
-  function poly(x, y, r, n, rot) {
-    ctx.beginPath();
-    for (let i = 0; i < n; i++) {
-      const a = rot + (i * 2 * Math.PI) / n;
-      if (i === 0) ctx.moveTo(x + Math.cos(a) * r, y + Math.sin(a) * r); else ctx.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
+  // The camera of the frame being drawn. Styles (P.style):
+  //   legacy - path built under the camera transform, a bigger filled circle + a smaller one on top (my first guess at the client)
+  //   xform  - path built under the camera transform, ONE fill and ONE darker stroke
+  //   real   - what the recorded client does for shapes: points already multiplied into canvas px (identity transform while the path is
+  //            built), filled twice, outline stroked afterwards under a rotated / scaled "pen" transform
+  const CAM = { x: 0, y: 0, z: 1, W: 1, H: 1 };
+  const toS = (x, y) => [(x - CAM.x) * CAM.z + CAM.W / 2, (y - CAM.y) * CAM.z + CAM.H / 2];
+  const useWorld = () => ctx.setTransform(CAM.z, 0, 0, CAM.z, CAM.W / 2 - CAM.x * CAM.z, CAM.H / 2 - CAM.y * CAM.z);
+  const useIdentity = () => ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const penTransform = (ang) => ctx.setTransform(CAM.z * Math.cos(ang), CAM.z * Math.sin(ang), -CAM.z * Math.sin(ang), CAM.z * Math.cos(ang), 0, 0);
+
+  // a closed polygon (world points) with a fill, an outline colour and a pen width in world units
+  function polyObj(wpts, fill, border, pen, ang) {
+    if (P.style === 'real') {
+      useIdentity();
+      ctx.beginPath();
+      const pts = wpts.map(([x, y]) => toS(x, y));
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i], b = pts[(i + 1) % pts.length];
+        if (i === 0) ctx.moveTo(a[0], a[1]); else ctx.lineTo(a[0], a[1]);
+        ctx.lineTo(a[0] + (b[0] - a[0]) * 0.4, a[1] + (b[1] - a[1]) * 0.4); // the client adds points along the edges
+      }
+      ctx.lineTo(pts[0][0], pts[0][1]);
+      const c = pts.reduce((m, q) => [m[0] + q[0] / pts.length, m[1] + q[1] / pts.length], [0, 0]);
+      ctx.moveTo(c[0], c[1]);
+      ctx.fillStyle = fill; ctx.fill(); ctx.fill();
+      penTransform(ang || 0); ctx.lineWidth = pen; ctx.lineJoin = 'round'; ctx.strokeStyle = border; ctx.stroke();
+      useIdentity();
+    } else {
+      useWorld();
+      ctx.beginPath();
+      wpts.forEach(([x, y], i) => { if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
+      ctx.closePath();
+      ctx.fillStyle = fill; ctx.fill();
+      ctx.strokeStyle = border; ctx.lineWidth = pen; ctx.lineJoin = 'round'; ctx.stroke();
     }
-    ctx.closePath();
   }
+  function ngon(x, y, r, n, rot) { const o = []; for (let i = 0; i < n; i++) { const a = rot + (i * 2 * Math.PI) / n; o.push([x + Math.cos(a) * r, y + Math.sin(a) * r]); } return o; }
   function drawShape(s) {
     const [fill, border, n] = s.k;
-    poly(s.x, s.y, s.r, n, s.a); ctx.fillStyle = border; ctx.fill();
-    poly(s.x, s.y, s.r - 5, n, s.a); ctx.fillStyle = fill; ctx.fill();
+    if (P.style === 'legacy') {
+      useWorld();
+      const poly = (r) => { ctx.beginPath(); ngon(s.x, s.y, r, n, s.a).forEach(([x, y], i) => { if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }); ctx.closePath(); };
+      poly(s.r); ctx.fillStyle = border; ctx.fill();
+      poly(s.r - 5); ctx.fillStyle = fill; ctx.fill();
+    } else polyObj(ngon(s.x, s.y, s.r, n, s.a), fill, border, 7.5, s.a);
   }
-  function drawBullet(x, y, col) {
-    ctx.beginPath(); ctx.arc(x, y, BR, 0, Math.PI * 2); ctx.fillStyle = col[1]; ctx.fill();
-    ctx.beginPath(); ctx.arc(x, y, BR - 3, 0, Math.PI * 2); ctx.fillStyle = col[0]; ctx.fill();
+  function circleObj(x, y, r, col, pen, ang) {
+    if (P.style === 'legacy') {
+      useWorld();
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = col[1]; ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, r - pen, 0, Math.PI * 2); ctx.fillStyle = col[0]; ctx.fill();
+    } else if (P.style === 'xform') {
+      useWorld();
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = col[0]; ctx.fill();
+      ctx.strokeStyle = col[1]; ctx.lineWidth = pen; ctx.stroke();
+    } else {
+      useIdentity();
+      const [sx, sy] = toS(x, y);
+      ctx.beginPath(); ctx.arc(sx, sy, r * CAM.z, 0, Math.PI * 2);
+      ctx.fillStyle = col[0]; ctx.fill(); ctx.fill();
+      penTransform(ang || 0); ctx.lineWidth = pen; ctx.strokeStyle = col[1]; ctx.stroke();
+      useIdentity();
+    }
   }
-  function drawTank(x, y, ang, col) {
-    ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
-    ctx.beginPath(); ctx.moveTo(0, -17); ctx.lineTo(R * 1.9, -17); ctx.lineTo(R * 1.9, 17); ctx.lineTo(0, 17); ctx.closePath();
-    ctx.fillStyle = '#999999'; ctx.fill(); ctx.strokeStyle = '#727272'; ctx.lineWidth = 4; ctx.stroke();
-    ctx.restore();
-    ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI * 2); ctx.fillStyle = col[1]; ctx.fill();
-    ctx.beginPath(); ctx.arc(x, y, R - 4, 0, Math.PI * 2); ctx.fillStyle = col[0]; ctx.fill();
+  function drawBullet(x, y, col) { circleObj(x, y, BR, col, 3, 0); }
+  function drawDrone(x, y, rot, col) { polyObj(ngon(x, y, 13, 3, rot), col[0], col[1], 4, rot); }
+  function drawTank(x, y, ang, col, R) {
+    R = R || 50;
+    const hw = (17 * R) / 50, len = R * 1.9;
+    if (P.style === 'real') {
+      const c = Math.cos(ang), sn = Math.sin(ang);
+      const corner = (u, v) => [x + c * u - sn * v, y + sn * u + c * v];
+      polyObj([corner(0, -hw), corner(len, -hw), corner(len, hw), corner(0, hw)], '#999999', '#727272', 4, ang);
+    } else {
+      useWorld();
+      ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
+      ctx.beginPath();
+      if (P.style === 'xform') ctx.rect(0, -hw, len, 2 * hw); else { ctx.moveTo(0, -hw); ctx.lineTo(len, -hw); ctx.lineTo(len, hw); ctx.lineTo(0, hw); ctx.closePath(); }
+      ctx.fillStyle = '#999999'; ctx.fill(); ctx.strokeStyle = '#727272'; ctx.lineWidth = 4; ctx.stroke();
+      ctx.restore();
+    }
+    circleObj(x, y, R, col, P.style === 'legacy' ? 4 : 7.5, ang);
+  }
+
+  // text: straight onto the canvas, or rendered into a small offscreen canvas that is blitted (the way a cached label would be)
+  const labelCache = new Map();
+  function putText(text, x, y, font, align, color, outline) {
+    const px = +/(\d+)px/.exec(font)[1];
+    if (P.textmode !== 'offscreen') {
+      ctx.font = font; ctx.textAlign = align; ctx.textBaseline = 'middle';
+      if (outline) { ctx.lineWidth = 5; ctx.strokeStyle = '#000000'; ctx.strokeText(text, x, y); }
+      ctx.fillStyle = color; ctx.fillText(text, x, y);
+      return;
+    }
+    const key = text + '|' + font + '|' + color;
+    let c = labelCache.get(key);
+    if (!c) {
+      c = document.createElement('canvas');
+      const t = c.getContext('2d');
+      t.font = font; const w = Math.ceil(t.measureText(text).width) + 12; c.width = w; c.height = px + 12;
+      t.font = font; t.textAlign = 'center'; t.textBaseline = 'middle';
+      if (outline) { t.lineWidth = 5; t.strokeStyle = '#000000'; t.strokeText(text, w / 2, c.height / 2); }
+      t.fillStyle = color; t.fillText(text, w / 2, c.height / 2);
+      if (labelCache.size > 200) labelCache.clear();
+      labelCache.set(key, c);
+    }
+    const ox = align === 'left' ? x : align === 'right' ? x - c.width : x - c.width / 2;
+    ctx.drawImage(c, ox, y - c.height / 2);
+  }
+  // name above the tank, health bar below it once damaged
+  function drawLabels(x, y, R, name, hp) {
+    if (!P.text) return;
+    if (P.style === 'real') {
+      useIdentity();
+      const [sx, sy] = toS(x, y), Z = CAM.z;
+      putText(name, sx, sy - (R + 28) * Z, `700 ${Math.round(22 * Z)}px Ubuntu, sans-serif`, 'center', '#ffffff', true);
+      if (hp < 0.999) {
+        const half = R * 0.9 * Z, yy = sy + (R + 22) * Z;
+        ctx.lineCap = 'round'; ctx.lineWidth = 8 * Z;
+        ctx.strokeStyle = '#555555'; ctx.beginPath(); ctx.moveTo(sx - half, yy); ctx.lineTo(sx + half, yy); ctx.stroke();
+        ctx.strokeStyle = '#85e37d'; ctx.beginPath(); ctx.moveTo(sx - half, yy); ctx.lineTo(sx - half + 2 * half * Math.max(0.02, hp), yy); ctx.stroke();
+        ctx.lineCap = 'butt';
+      }
+      return;
+    }
+    useWorld();
+    putText(name, x, y - R - 28, '700 22px Ubuntu, sans-serif', 'center', '#ffffff', true);
+    if (hp < 0.999) {
+      const half = R * 0.9, yy = y + R + 22;
+      ctx.lineCap = 'round'; ctx.lineWidth = 8;
+      ctx.strokeStyle = '#555555'; ctx.beginPath(); ctx.moveTo(x - half, yy); ctx.lineTo(x + half, yy); ctx.stroke();
+      ctx.strokeStyle = '#85e37d'; ctx.beginPath(); ctx.moveTo(x - half, yy); ctx.lineTo(x - half + 2 * half * Math.max(0.02, hp), yy); ctx.stroke();
+      ctx.lineCap = 'butt';
+    }
+  }
+  function drawHud(snap) {
+    if (!P.text) return;
+    useIdentity();
+    const W = cv.width;
+    // leaderboard, top right: "Name - 12.3k"
+    const rows = snap.e.map((e) => ({ n: e.name, s: e.score })).concat([{ n: 'You', s: myScore }]).sort((a, b) => b.s - a.s).slice(0, 10);
+    const F15 = '700 15px Ubuntu, sans-serif';
+    putText('Leaderboard', W - 160, 20, F15, 'left', '#ffffff', false);
+    rows.forEach((r, i) => { ctx.fillStyle = 'rgba(80,80,80,0.5)'; ctx.fillRect(W - 170, 36 + i * 22, 150, 18); putText(`${r.n} - ${fmtScore(r.s)}`, W - 164, 45 + i * 22, F15, 'left', '#ffffff', false); });
+    putText(`Score: ${fmtScore(myScore)}`, W / 2, cv.height - 54, F15, 'center', '#ffffff', false);
+    putText(`Lvl ${P.lvl} Tank`, W / 2, cv.height - 30, F15, 'center', '#ffffff', false);
   }
 
   function render() {
-    const W = cv.width, H = cv.height, Z = P.zoom;
+    const W = cv.width, H = cv.height;
+    const Z = P.zoom * (P.zoomanim ? 1 + 0.1 * Math.sin(simT * 1.1) : 1);
+    ZCUR = Z;
+    CAM.x = player.x; CAM.y = player.y; CAM.z = Z; CAM.W = W; CAM.H = H;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = '#cdcdcd'; ctx.fillRect(0, 0, W, H);
@@ -248,14 +463,20 @@
     if (P.wrapGrid) { e = ((e % cell) + cell) % cell; f = ((f % cell) + cell) % cell; }
     ctx.setTransform(Z, 0, 0, Z, e, f);
     ctx.fillStyle = gridPattern; ctx.fillRect(-120, -120, W / Z + 240, H / Z + 240);
-    ctx.setTransform(Z, 0, 0, Z, W / 2 - player.x * Z, H / 2 - player.y * Z);
+    useIdentity();
     for (const s of shapes) drawShape(s);
     const snap = sample(simT - P.renderDelay);
     for (const b of snap.b) drawBullet(b.x, b.y, b.owner === 'me' ? COL.me : COL.foe);
     const nowT = performance.now();
-    for (const en of snap.e) drawTank(en.x, en.y, en.angle, nowT < flashFoeUntil ? FLASH_FOE : COL.foe);
-    drawTank(player.x, player.y, player.angle, nowT < flashPlayerUntil ? FLASH : COL.me);
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    for (const en of snap.e) {
+      if (P.noise > 0) { en.x += P.noise * gauss(); en.y += P.noise * gauss(); }
+      if (P.drones) for (let i = 0; i < P.drones; i++) { const a = simT * 1.7 + (i * 2 * Math.PI) / P.drones; drawDrone(en.x + Math.cos(a) * (en.r + 70), en.y + Math.sin(a) * (en.r + 70), a + 1.57, COL.foe); }
+      drawTank(en.x, en.y, en.angle, nowT < flashFoeUntil ? FLASH_FOE : COL.foe, en.r);
+    }
+    drawTank(player.x, player.y, player.angle, nowT < flashPlayerUntil ? FLASH : COL.me, PR);
+    for (const en of snap.e) drawLabels(en.x, en.y, en.r, en.name, en.hp);
+    useIdentity();
+    drawHud(snap);
   }
 
   let last = performance.now();
@@ -275,9 +496,11 @@
     resetStats() { stats.fired = 0; stats.hits = 0; stats.expired = 0; stats.eToggles = 0; stats.frames = 0; barrel.length = 0; },
     setPattern(p) { P.pattern = p; makeEnemies(); },
     simT: () => simT,
+    myScore: () => myScore,
     flashPlayer(ms) { flashPlayerUntil = performance.now() + ms; },
     flashEnemies(ms) { flashFoeUntil = performance.now() + ms; },
-    addEnemy(spec) { const e = Object.assign({ id: idSeq++, x: 0, y: 0, vx: 0, vy: 0, angle: 0, nextTurn: 0, phase: 0, hp: 0, pattern: 'still' }, spec); enemies.push(e); return e.id; },
+    addEnemy(spec) { const e = newEnemy(spec); enemies.push(e); return e.id; },
+    setScoreOfYou(n) { /* the leaderboard row of the player is fixed at 1.2k */ },
     removeEnemy(id) { const i = enemies.findIndex((e) => e.id === id); if (i >= 0) enemies.splice(i, 1); },
     clearEnemies() { enemies.length = 0; },
     get autoFire() { return autoFire; },

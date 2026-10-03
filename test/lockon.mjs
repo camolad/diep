@@ -13,6 +13,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const scripts = [];
 let storeKey = {};
+if (process.env.DIEP_SCRIPT) scripts.push(['new', path.resolve(process.env.DIEP_SCRIPT)]);
 for (const a of process.argv.slice(2)) {
   const m = a.match(/^([\w.-]+)=(.+)$/);
   if (m) { scripts.push([m[1], path.resolve(m[2])]); }
