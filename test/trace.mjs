@@ -1,5 +1,5 @@
 // Draws what an observer sees: the barrel angle over time against the ideal angle, and its angular speed.
-//   DIEP_SCRIPT=work/next.user.js node test/trace.mjs out.png [pattern] [cfg-json]
+//   DIEP_SCRIPT=diep-assist.user.js node test/trace.mjs out.png [pattern] [cfg-json]
 import { chromium } from 'playwright';
 import http from 'node:http';
 import fs from 'node:fs';

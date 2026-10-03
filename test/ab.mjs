@@ -1,4 +1,4 @@
-// A/B of the prediction learner: the same mock scenarios with `dodge` off and on.   DIEP_SCRIPT=work/next.user.js node test/ab.mjs
+// A/B of the prediction learner: the same mock scenarios with `dodge` off and on.   DIEP_SCRIPT=diep-assist.user.js node test/ab.mjs
 import { scenario, browser, server } from './run.mjs';
 const script = process.env.DIEP_SCRIPT;
 const rows = [];

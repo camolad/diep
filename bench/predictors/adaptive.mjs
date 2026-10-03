@@ -15,7 +15,7 @@
 //
 // Portable: plain JavaScript, no imports, no Date / Math.random.
 export function createPredictor(opts = {}) {
-  const TAU = opts.tau === undefined ? 1.2 : opts.tau;
+  let TAU = opts.tau === undefined ? 1.2 : opts.tau;
   const WIN = 220;
   const DODGER_MIN = opts.dmin === undefined ? 0.25 : opts.dmin;
   const Z_MIN = opts.zmin === undefined ? 2.2 : opts.zmin;
@@ -117,7 +117,7 @@ export function createPredictor(opts = {}) {
     return { x: x1 + vcx * k, y: y1 + vcy * k };
   }
   // self-scoring: how well did each model predict this target 0.45 s later?
-  const due = []; let errCV = 900, errRH = 900;
+  const due = []; let errCV = 900, errRH = 900, nextScoreT = 0;
 
   // ---- dodge ----
   let sideP = 1, sideN = 2, dodgeSpeed = 260, retain = 0.4;   // retain: how much of its pre-dodge velocity the target takes back after a dodge   // Beta-ish counts: dodge probability, favoured side (+ = left of the bullet)
@@ -193,7 +193,8 @@ export function createPredictor(opts = {}) {
       errCV += (Math.hypot(q.cx - x, q.cy - y) ** 2 - errCV) * 0.08;
       if (q.rx !== undefined) errRH += (Math.hypot(q.rx - x, q.ry - y) ** 2 - errRH) * 0.08;
     }
-    if (n > 8 && Math.round(t * 60) % 4 === 0) {
+    if (n > 8 && t >= nextScoreT) {
+      nextScoreT = t + 0.06;
       const r = rhythm(), a = decay(0.45), q = { t: t + 0.45, cx: fit.x + fit.vx * a, cy: fit.y + fit.vy * a };
       if (r) { const p = rhythmPos(r, 0.45); q.rx = p.x; q.ry = p.y; }
       due.push(q);
@@ -248,7 +249,7 @@ export function createPredictor(opts = {}) {
     return out;
   }
   return {
-    observe, predict, onShot() {}, dbg: () => ({ retain, revs: revs.slice(), r: rhythm(), errCV, errRH, vRef, pd: tN ? Math.max(0, dLat - dLon) / tN : 0, tN, dLat, dLon, pL: sideP / sideN }),
-    reset() { hist.length = 0; fit = { x: 0, y: 0, vx: 0, vy: 0 }; started = false; revs.length = 0; episodes.length = 0; due.length = 0; lhist.length = 0; tN = 0; dLat = 0; dLon = 0; dir = null; posSide = 0; vRef = 250; errCV = 900; errRH = 900; },
+    observe, predict, onShot() {}, setTau(v) { TAU = v; }, dbg: () => ({ retain, revs: revs.slice(), r: rhythm(), errCV, errRH, vRef, pd: tN ? Math.max(0, dLat - dLon) / tN : 0, tN, dLat, dLon, pL: sideP / sideN }),
+    reset() { hist.length = 0; fit = { x: 0, y: 0, vx: 0, vy: 0 }; started = false; revs.length = 0; episodes.length = 0; due.length = 0; lhist.length = 0; nextScoreT = 0; tN = 0; dLat = 0; dLon = 0; dir = null; posSide = 0; vRef = 250; errCV = 900; errRH = 900; },
   };
 }

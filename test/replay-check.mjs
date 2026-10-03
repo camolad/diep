@@ -1,5 +1,5 @@
 // Checks that recorded frames go through the hooks the way they should.
-//   DIEP_SCRIPT=work/next.user.js node test/replay-check.mjs
+//   DIEP_SCRIPT=diep-assist.user.js node test/replay-check.mjs
 //
 //  1. test/fixtures/client-probe-partial.json  - REAL: the first 400 draw calls of a frame of the actual client (a team arena, no tank on
 //     screen yet). Checks the geometry handling on real data: translucent bases ignored, grid read, the 30 small triangles seen as drones.
@@ -10,6 +10,7 @@ import { chromium } from 'playwright';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { replay } from './replay.mjs';
 
@@ -54,7 +55,7 @@ for (const style of ['real', 'xform', 'legacy']) {
       }, 0);
     });
   }));
-  const file = path.join(here, '..', 'work', `rt-${style}.json`);
+  const file = path.join(os.tmpdir(), `diep-rt-${style}.json`);
   fs.writeFileSync(file, JSON.stringify(out.data));
   await ctx.close();
   const r = await replay(file, { browser });
@@ -67,6 +68,56 @@ for (const style of ['real', 'xform', 'legacy']) {
   fs.rmSync(file, { force: true });
 }
 server.close();
+
+/* 3. hand-made frames for the edge cases found in review (not the mock, not real data) */
+{
+  const draw = () => {
+    const c = document.getElementById('canvas'), x = c.getContext('2d');
+    const tile = Object.assign(document.createElement('canvas'), { width: 50, height: 50 });
+    const pat = x.createPattern(tile, 'repeat');
+    const grad = x.createLinearGradient(0, 0, 800, 0);
+    x.setTransform(1, 0, 0, 1, 0, 0); x.clearRect(0, 0, 800, 600);
+    x.setTransform(0.5, 0, 0, 0.5, 13, 7); x.fillStyle = pat; x.fillRect(0, 0, 1700, 1300);   // the grid (zoom 0.5)
+    x.setTransform(1, 0, 0, 1, 0, 0); x.fillStyle = grad; x.fillRect(0, 0, 800, 600);        // a gradient fill must not replace the grid
+    // a tank at the centre: grey barrel polygon, then a round body with a trailing moveTo(centre), filled twice and stroked
+    x.beginPath(); x.moveTo(400, 290); x.lineTo(470, 290); x.lineTo(470, 310); x.lineTo(400, 310); x.fillStyle = '#999999'; x.fill(); x.fill(); x.strokeStyle = '#727272'; x.lineWidth = 3; x.stroke();
+    x.beginPath(); x.arc(400, 300, 25, 0, Math.PI * 2); x.moveTo(400, 300); x.fillStyle = '#00b2e1'; x.fill(); x.fill(); x.strokeStyle = '#0085a8'; x.stroke();
+    // a team-coloured triangle built under translate + scale
+    x.save(); x.translate(600, 400); x.scale(2, 2); x.beginPath(); x.moveTo(-10, 8); x.lineTo(10, 8); x.lineTo(0, -12); x.closePath(); x.fillStyle = '#f14e54'; x.fill(); x.restore();
+    x.setTransform(1, 0, 0, 1, 0, 0);
+  };
+  const summarise = () => {
+    const f = diepAssist.S.ready, q = (v) => v.map((e) => ({ x: Math.round(e.x), y: Math.round(e.y), r: Math.round(e.r) }));
+    return f && { tanks: q(f.tanks), bullets: q(f.bullets), drones: q(f.drones), grid: f.grid && { zoom: f.grid.zoom, tw: f.grid.tw } };
+  };
+  const server2 = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><body style="margin:0"><canvas id="canvas" width="800" height="600"></canvas></body>'); });
+  await new Promise((r) => server2.listen(0, r));
+  const ctx = await browser.newContext({ viewport: { width: 800, height: 600 }, deviceScaleFactor: 1 });
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push(String(e)));
+  await page.addInitScript({ path: SCRIPT });
+  await page.goto(`http://localhost:${server2.address().port}/`);
+  const out = await page.evaluate(([drawSrc, sumSrc]) => new Promise((resolve) => {
+    const drawF = new Function('return ' + drawSrc)(), sumF = new Function('return ' + sumSrc)();
+    drawF(); const c = document.getElementById('canvas'); c.getContext('2d').clearRect(0, 0, 800, 600);   // flush
+    const live = sumF();
+    diepAssist.recordFrames(1, (data) => { resolve({ live, data }); });
+    const x = c.getContext('2d');
+    drawF(); drawF(); x.clearRect(0, 0, 800, 600);
+  }), [draw.toString(), summarise.toString()]);
+  fs.writeFileSync(path.join(os.tmpdir(), 'diep-rt-hand.json'), JSON.stringify(out.data));
+  await ctx.close(); server2.close();
+  const L = out.live;
+  check('hand-made: a round body whose path also has a moveTo(centre) is still a tank', L && L.tanks.length === 1 && L.tanks[0].r === 25 && L.bullets.length === 0, JSON.stringify(L && L.tanks));
+  check('hand-made: a gradient fill does not replace the grid', L && L.grid && L.grid.zoom === 0.5 && L.grid.tw === 50, JSON.stringify(L && L.grid));
+  check('hand-made: a triangle built under translate + scale is read at the right place and size (drone at 600,400, r ~ 24)', L && L.drones.length === 1 && Math.abs(L.drones[0].x - 600) <= 3 && Math.abs(L.drones[0].y - 402) <= 6 && Math.abs(L.drones[0].r - 24) <= 3, JSON.stringify(L && L.drones));
+  const r = await replay(path.join(os.tmpdir(), 'diep-rt-hand.json'), { browser });
+  const same = r.seen && r.seen.drones.length === 1 && Math.abs(r.seen.drones[0].x - L.drones[0].x) <= 1 && Math.abs(r.seen.drones[0].r - L.drones[0].r) <= 1 && r.seen.tanks.length === 1;
+  check('hand-made: replaying the recording (translate / scale / restore) gives the same frame', same, JSON.stringify(r.seen && { tanks: r.seen.tanks, drones: r.seen.drones }));
+  check('hand-made: no page errors', errs.length === 0 && r.pageErrors.length === 0, errs.join('|'));
+  fs.rmSync(path.join(os.tmpdir(), 'diep-rt-hand.json'), { force: true });
+}
 console.log(`\n${pass} passed, ${failed} failed`);
 await browser.close();
 process.exit(failed ? 1 : 0);

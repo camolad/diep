@@ -84,7 +84,7 @@ inherit my velocity* (if shots miss only while you strafe), the other *Fire meth
   bases and the 30 small polygons are read as expected (`test/replay-check.mjs`).
 * **Mock arena (my own, not real):** `test/mock-diep.html` draws in three styles (`real` = the recorded path style, `xform`, `legacy`),
   optionally with text in offscreen canvases, circles as polygons, drones, a breathing zoom and a rough network. Feature checks
-  (`features.mjs` 28, `features2.mjs` 32) pass in every style.
+  (`features.mjs` 28, `features2.mjs` 33, `replay-check.mjs` 21) pass in every style.
 * **Benchmark opponents (my own, not real):** `bench/` - see `bench/RESULTS.md`.
 * **Not verified:** anything involving a real tank/barrel/text/health-bar frame, real server timing, or real players' dodging.
 
@@ -104,5 +104,5 @@ node bench/sweep.mjs adaptive mild 16 100   # predictor benchmark
 ## Layout
 
 `diep-assist.user.js` the script (one file, sections 1-16 - hooks, world model, aim solver, cursor control, build, UI) -
-`bench/` predictor benchmark and the learner's source of truth (`predictors/adaptive.mjs`, embedded by `work/embed_pred.py`) -
-`test/` mock arena, tests, recorded fixtures - `work/` small helper code and experiments.
+`bench/` predictor benchmark and the learner's source of truth (`predictors/adaptive.mjs`, embedded by `bench/embed.py`) -
+`test/` mock arena, tests, recorded fixtures.

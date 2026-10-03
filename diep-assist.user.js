@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Diep Assist (private server testing)
 // @namespace    https://github.com/camolad/diep
-// @version      2.1.0
+// @version      2.2.0
 // @description  Smooth predictive auto-aim, auto-fire, ESP, shape farming, auto-build scheduler and quality-of-life tools for a private diep.io-style server you run yourself.
 // @match        http://localhost/*
 // @match        http://localhost:*/*
@@ -37,8 +37,8 @@
 
   if (window.__diepAssistLoaded) return;
   window.__diepAssistLoaded = true;
-  const VERSION = '2.1.0';
-  if (/(^|\.)diep\.io$/i.test(location.hostname)) {
+  const VERSION = '2.2.0';
+  if (/(^|\.)diep\.io\.?$/i.test(location.hostname)) {
     console.warn('[Diep Assist] Disabled on the public diep.io - this script is for private servers you run yourself.');
     return;
   }
@@ -148,12 +148,15 @@
     ui: { tab: 'Aim', x: null, y: null, open: true },
   };
 
+  // only known actions with string codes are taken from stored / imported settings
+  const mergeKeys = (dst, src) => { if (src && typeof src === 'object') for (const a of Object.keys(dst)) if (typeof src[a] === 'string') dst[a] = src[a]; };
   function loadConfig() {
     const c = JSON.parse(JSON.stringify(DEFAULTS));
     try {
       const saved = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
       for (const k of Object.keys(saved)) {
-        if (k === 'keys' || k === 'ui') Object.assign(c[k], saved[k]);
+        if (k === 'keys') mergeKeys(c.keys, saved.keys);
+        else if (k === 'ui') Object.assign(c.ui, saved.ui);
         else if (k in c && typeof saved[k] === typeof c[k]) c[k] = saved[k];
       }
     } catch { /* storage blocked: defaults */ }
@@ -367,6 +370,20 @@
       if (typeof o === 'function') op[n] = function (text, x, y) { try { onTextAny(this, text, x, y); } catch (e) { fail(e); } return o.apply(this, arguments); };
     }
   }
+  // a cached text canvas is also "cleared" by resizing it or (OffscreenCanvas) by its own clearRect: forget its labels then
+  try {
+    for (const C of [window.HTMLCanvasElement, window.OffscreenCanvas]) {
+      if (!C) continue;
+      for (const k of ['width', 'height']) {
+        const d = Object.getOwnPropertyDescriptor(C.prototype, k);
+        if (d && d.set && d.get) Object.defineProperty(C.prototype, k, { configurable: true, enumerable: d.enumerable, get: d.get, set(v) { try { const r = textCanvas.get(this); if (r) r.texts.length = 0; } catch { /* ignore */ } return d.set.call(this, v); } });
+      }
+    }
+    if (typeof OffscreenCanvasRenderingContext2D !== 'undefined') {
+      const op = OffscreenCanvasRenderingContext2D.prototype, oc = op.clearRect;
+      if (typeof oc === 'function') op.clearRect = function (x, y, w, h) { try { const c = this.canvas, r = textCanvas.get(c); if (r && w >= c.width * 0.9 && h >= c.height * 0.9) r.texts.length = 0; } catch { /* ignore */ } return oc.apply(this, arguments); };
+    }
+  } catch { /* ignore */ }
   proto.drawImage = function (img) {
     try { if (this.canvas === S.canvas && S.cur && img && textCanvas.has(img)) onTextImage(this, arguments); } catch (e) { fail(e); }
     return orig.drawImage.apply(this, arguments);
@@ -394,12 +411,15 @@
   }
 
   // The background grid: a CanvasPattern fill. Its origin on screen says where the camera is; its scale is the zoom.
-  function onGridFill(ctx) {
+  function onGridFill(ctx, w, h) {
     const t = ctx.getTransform();
     const zoom = hyp(t.a, t.b);
     const info = patternInfo.get(ctx.fillStyle);
-    const tw = info ? info.w * (info.sx || 1) : 0, th = info ? info.h * (info.sy || 1) : 0; // tile size in world units
-    S.cur.grid = { e: t.e, f: t.f, zoom, tw, th, pw: tw * zoom, ph: th * zoom };
+    if (!info) return; // a gradient or a pattern the script never saw created is not the grid
+    const tw = info.w * (info.sx || 1), th = info.h * (info.sy || 1); // tile size in world units
+    const area = Math.abs(w * h) * zoom * zoom;
+    if (S.cur.grid && S.cur.grid.area >= area) return; // the biggest pattern fill of the frame is the grid
+    S.cur.grid = { e: t.e, f: t.f, zoom, tw, th, pw: tw * zoom, ph: th * zoom, area };
   }
 
   function rectPrim(ctx, x, y, w, h) {
@@ -410,7 +430,7 @@
   }
   function onFillRect(ctx, x, y, w, h) {
     const fs = ctx.fillStyle;
-    if (fs && typeof fs === 'object') { onGridFill(ctx); return; }
+    if (fs && typeof fs === 'object') { onGridFill(ctx, w, h); return; }
     const f = S.cur;
     if (f.prims.length >= 4000) return;
     const col = parseColor(fs);
@@ -468,10 +488,13 @@
   }
   function pathGeom() {
     const pts = PA.pts, n = pts.length >> 1, arcs = PA.arcs;
-    if (arcs.length >= 1 && n === 0) {
+    if (arcs.length >= 1) {
       let a = arcs[0];
       for (const b of arcs) if (b.r > a.r) a = b;
-      if (arcs.every((b) => hyp(b.x - a.x, b.y - a.y) < Math.max(1.5, a.r * 0.15))) return { t: 'c', x: a.x, y: a.y, r: a.r };
+      // a lone moveTo(centre) before or after the arc (the client ends its polygons like that) does not make it a polygon
+      let inside = true;
+      for (let i = 0; i < n; i++) if (hyp(pts[2 * i] - a.x, pts[2 * i + 1] - a.y) > a.r * 1.1 + 1) { inside = false; break; }
+      if (inside && arcs.every((b) => hyp(b.x - a.x, b.y - a.y) < Math.max(1.5, a.r * 0.15))) return { t: 'c', x: a.x, y: a.y, r: a.r };
     }
     if (arcs.length === 0 && n === 2) return { t: 'l', x1: pts[0], y1: pts[1], x2: pts[2], y2: pts[3] };
     if (PA.over) return null;
@@ -688,6 +711,7 @@
       const prev = proto[m];
       if (typeof prev !== 'function') continue;
       const wrap = function () {
+        if (recJob !== job) return prev.apply(this, arguments); // a finished recording passes calls straight through
         const ret = prev.apply(this, arguments);
         try {
           const c = this.canvas;
@@ -867,7 +891,7 @@
   //
   // Portable: plain JavaScript, no imports, no Date / Math.random.
   function createPredictor(opts = {}) {
-    const TAU = opts.tau === undefined ? 1.2 : opts.tau;
+    let TAU = opts.tau === undefined ? 1.2 : opts.tau;
     const WIN = 220;
     const DODGER_MIN = opts.dmin === undefined ? 0.25 : opts.dmin;
     const Z_MIN = opts.zmin === undefined ? 2.2 : opts.zmin;
@@ -969,7 +993,7 @@
       return { x: x1 + vcx * k, y: y1 + vcy * k };
     }
     // self-scoring: how well did each model predict this target 0.45 s later?
-    const due = []; let errCV = 900, errRH = 900;
+    const due = []; let errCV = 900, errRH = 900, nextScoreT = 0;
 
     // ---- dodge ----
     let sideP = 1, sideN = 2, dodgeSpeed = 260, retain = 0.4;   // retain: how much of its pre-dodge velocity the target takes back after a dodge   // Beta-ish counts: dodge probability, favoured side (+ = left of the bullet)
@@ -1045,7 +1069,8 @@
         errCV += (Math.hypot(q.cx - x, q.cy - y) ** 2 - errCV) * 0.08;
         if (q.rx !== undefined) errRH += (Math.hypot(q.rx - x, q.ry - y) ** 2 - errRH) * 0.08;
       }
-      if (n > 8 && Math.round(t * 60) % 4 === 0) {
+      if (n > 8 && t >= nextScoreT) {
+        nextScoreT = t + 0.06;
         const r = rhythm(), a = decay(0.45), q = { t: t + 0.45, cx: fit.x + fit.vx * a, cy: fit.y + fit.vy * a };
         if (r) { const p = rhythmPos(r, 0.45); q.rx = p.x; q.ry = p.y; }
         due.push(q);
@@ -1100,9 +1125,16 @@
       return out;
     }
     return {
-      observe, predict, onShot() {}, dbg: () => ({ retain, revs: revs.slice(), r: rhythm(), errCV, errRH, vRef, pd: tN ? Math.max(0, dLat - dLon) / tN : 0, tN, dLat, dLon, pL: sideP / sideN }),
-      reset() { hist.length = 0; fit = { x: 0, y: 0, vx: 0, vy: 0 }; started = false; revs.length = 0; episodes.length = 0; due.length = 0; lhist.length = 0; tN = 0; dLat = 0; dLon = 0; dir = null; posSide = 0; vRef = 250; errCV = 900; errRH = 900; },
+      observe, predict, onShot() {}, setTau(v) { TAU = v; }, dbg: () => ({ retain, revs: revs.slice(), r: rhythm(), errCV, errRH, vRef, pd: tN ? Math.max(0, dLat - dLon) / tN : 0, tN, dLat, dLon, pL: sideP / sideN }),
+      reset() { hist.length = 0; fit = { x: 0, y: 0, vx: 0, vy: 0 }; started = false; revs.length = 0; episodes.length = 0; due.length = 0; lhist.length = 0; nextScoreT = 0; tN = 0; dLat = 0; dLon = 0; dir = null; posSide = 0; vRef = 250; errCV = 900; errRH = 900; },
     };
+  }
+
+  // a track that turns out to be a different tank than it was: forget everything learned about the old one
+  function resetIdentity(tk) {
+    tk.score = null; tk.scoreT = 0; tk.hp = null; tk.hpT = 0; tk.shotAtMeT = 0; tk.hitByMeT = 0; tk.shotsAtMe = 0; tk.lvlSm = 0;
+    if (S.pinId === tk.id) S.pinId = 0;
+    if (tk.pred) tk.pred.reset();
   }
 
   class Track {
@@ -1172,7 +1204,7 @@
     const dt = (f.t - prev.t) / 1000;
     if (dt < 0.002 || dt > 0.6) { cam.src = 'gap'; f.camSnap = { x: cam.x, y: cam.y, zoom: cam.zoom, dx: 0, dy: 0 }; return; }
     const Z = cam.zoom;
-    const age = Math.min(0.1, dt);
+    const age = dt; // dt is already limited to (0.002, 0.6] above
     const px = cam.x + cam.track.vx * age, py = cam.y + cam.track.vy * age; // dead-reckoned camera
     const sx = (wx) => (wx - px) * Z + S.cw / 2, sy = (wy) => (wy - py) * Z + S.ch / 2;
 
@@ -1231,6 +1263,7 @@
       const px = tk.x + tk.vx * Math.min(dt, 0.3), py = tk.y + tk.vy * Math.min(dt, 0.3);
       const gate = gateOf(tk, dt);
       for (let j = 0; j < dets.length; j++) {
+        if (dt > 0.3 && tk.rW > 0 && Math.abs(dets[j].r - tk.rW) > 0.3 * tk.rW) continue; // a ghost is only re-acquired by something of its size
         const d = hyp(dets[j].wx - px, dets[j].wy - py);
         if (d < gate) pairs.push({ d, tk, j });
       }
@@ -1341,12 +1374,12 @@
         const sc = dx + Math.abs(dy - rpx * 1.6);
         if (sc < bs) { bs = sc; best = tx; }
       }
-      if (best) tk.name = best.text;
+      if (best) { if (tk.name && !sameName(tk.name, best.text)) resetIdentity(tk); tk.name = best.text; }
       const lv = levelEstimate(tk);
       if (lv !== null) tk.lvlSm = tk.lvlSm ? tk.lvlSm + (lv - tk.lvlSm) * 0.1 : lv; // median-ish: smoothed over ~10 frames
       if (tk.name && S.leaderboard.length) {
         const hits = S.leaderboard.filter((r) => sameName(r.name, tk.name));
-        if (hits.length === 1 && !/^(unnamed|)$/i.test(normName(tk.name))) { tk.score = hits[0].score; tk.scoreT = t; claimed.add(hits[0]); }
+        if (hits.length === 1 && !/^(unnamed|)$/i.test(normName(tk.name)) && seen.filter((o) => o.name && sameName(o.name, hits[0].name)).length === 1) { tk.score = hits[0].score; tk.scoreT = t; claimed.add(hits[0]); }
       }
     }
     // blank / duplicate names: pair the remaining leaderboard rows with the remaining tanks by level (largest <-> highest score)
@@ -1363,7 +1396,10 @@
     }
     for (const tk of seen) if (tk.score !== null && t - tk.scoreT > 8000) tk.score = null;
     // health bars: the last fraction seen is kept (a bar fades, it does not mean the tank healed)
-    const hm = matchHealth(f.bars, seen.map((tk) => ({ x: tk.sx, y: tk.sy, r: tk.rW * cam.zoom })));
+    const owners = seen.map((tk) => ({ x: tk.sx, y: tk.sy, r: tk.rW * cam.zoom }));
+    if (S.me) owners.push({ x: S.me.x, y: S.me.y, r: S.me.r }); // my own bar and my allies' must not be given to an enemy
+    if (S.selfCol) for (const e of f.tanks) if (e !== S.self && sameTeam(e.col, S.selfCol)) owners.push({ x: e.x, y: e.y, r: e.r });
+    const hm = matchHealth(f.bars, owners);
     seen.forEach((tk, i) => { if (hm.has(i)) { tk.hp = hm.get(i); tk.hpT = t; } });
   }
 
@@ -1686,6 +1722,7 @@
     const me = S.selfTrack;
     if (!me) return null;
     const tau = cfg.persistence;
+    if (tk.pred) tk.pred.setTau(tau);
     const age = Math.max(0, (t - tk.last) / 1000);
     const L = cfg.predict ? effLatency() : 0;
     const mature = clamp((tk.last - tk.first - 40) / 100, 0, 1); // lead fades in over the first 140 ms of a track
@@ -1911,11 +1948,11 @@
 
   // `belief` is whether the game's auto-fire (E) is believed to be on. E is a toggle, so the script keeps
   // a belief and corrects it from what actually happens (bullets appearing, or not).
-  const F = { belief: false, lastPress: -1e9, spaceHeld: false, want: false, births: [], seenBirth: -1e9 };
+  const F = { mine: false, belief: false, lastPress: -1e9, spaceHeld: false, want: false, births: [], seenBirth: -1e9 };
 
   function pressE() {
     sendKey('keydown', 'e'); sendKey('keyup', 'e');
-    F.belief = !F.belief; F.lastPress = nowMs();
+    F.belief = !F.belief; F.lastPress = nowMs(); F.mine = F.belief;
   }
 
   function fireControl(t) {
@@ -1941,13 +1978,14 @@
       F.births.push(S.lastOwnBirth);
       if (F.births.length > 6) F.births.shift();
     }
-    if (F.belief && t - Math.max(S.lastOwnBirth, F.lastPress) > 3000) F.belief = false; // "on" but nothing fires
+    if (F.belief && t - Math.max(S.lastOwnBirth, F.lastPress) > 3000) { F.belief = false; F.mine = false; } // "on" but nothing fires
     if (!F.belief && !S.mouseL && !S.spaceDown) {
       const recent = F.births.filter((b) => t - b < 3000 && b > F.lastPress + 500);
-      if (recent.length >= 3) F.belief = true; // bullets keep coming with the button up: it is on
+      if (recent.length >= 3) { F.belief = true; F.mine = false; } // bullets keep coming with the button up: it is on
     }
     if (want !== F.belief && t - F.lastPress > 300 && (cfg.autoFire || F.belief)) {
-      if (want || (F.belief && cfg.autoFire)) pressE();
+      // switch the game's auto-fire off again only if the script switched it on (or the script is still in charge of firing)
+      if (want || (F.belief && (F.mine || (cfg.autoFire && cfg.enabled)))) pressE();
     }
   }
 
@@ -2363,7 +2401,7 @@
       let n = 0;
       for (const k of Object.keys(src)) {
         if (k === 'ui' || k === 'measured') continue;
-        if (k === 'keys' && src.keys && typeof src.keys === 'object') { Object.assign(cfg.keys, src.keys); n++; }
+        if (k === 'keys' && src.keys && typeof src.keys === 'object') { mergeKeys(cfg.keys, src.keys); n++; }
         else if (k in cfg && typeof src[k] === typeof cfg[k]) { cfg[k] = src[k]; n++; }
       }
       save(); applyClean(); refreshAll();
@@ -2715,7 +2753,10 @@
     panel.addEventListener('mouseenter', () => { S.panelHover = true; });
     panel.addEventListener('mouseleave', () => { S.panelHover = false; });
     // keep typing in the menu away from the game (digits would buy stat points)
-    for (const ev of ['keydown', 'keyup', 'keypress']) panel.addEventListener(ev, (e) => e.stopPropagation());
+    for (const ev of ['keydown', 'keyup', 'keypress']) panel.addEventListener(ev, (e) => { if (isTyping(e.target)) e.stopPropagation(); });
+    // a clicked switch / slider / button must not keep the keyboard: hand it back to the game
+    panel.addEventListener('click', (e) => { const t = e.target; if (t && t.blur && !isTyping(t) && /^(INPUT|BUTTON|SELECT)$/.test(t.tagName)) t.blur(); });
+    panel.addEventListener('change', (e) => { const t = e.target; if (t && t.blur && t.tagName === 'SELECT') t.blur(); });
     // drag by the header
     let drag = null;
     head.addEventListener('pointerdown', (e) => {
@@ -2737,16 +2778,18 @@
   function applyClean() {
     if (panel) panel.style.display = cfg.ui.open && !cfg.clean ? '' : 'none';
     if (S.overlay) S.overlay.style.display = cfg.clean ? 'none' : '';
+    if (toastEl) toastEl.style.display = cfg.clean ? 'none' : '';
     if (cfg.clean) S.panelHover = false;
   }
   function togglePanel() {
     cfg.ui.open = !cfg.ui.open; save();
+    if (binding) { binding = null; refreshAll(); }
     applyClean();
     if (!cfg.ui.open) S.panelHover = false;
   }
   let toastTimer = 0;
   function toast(msg) {
-    if (!toastEl) return;
+    if (!toastEl || cfg.clean) return;
     toastEl.textContent = msg; toastEl.style.opacity = '1';
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { toastEl.style.opacity = '0'; }, 1300);
@@ -2768,7 +2811,10 @@
     }
     if (!S.playing) return 'not in game';
     if (!S.sol) return S.tanks.some((t) => t.seen) ? 'enemies are out of range or filtered out' : 'no enemy on screen';
-    return 'locked on ' + (S.sol.tk.name || '#' + S.sol.tk.id);
+    const who = S.sol.tk.name || '#' + S.sol.tk.id;
+    if (!cfg.aim) return 'target ' + who + ' selected, but auto aim is off';
+    if (!ctl.on) return 'target ' + who + ' selected, waiting (' + (cfg.aimMode === 'hold' ? 'hold the aim key' : cfg.aimMode === 'firing' ? 'start firing' : cfg.aimMode === 'near' ? 'point nearer the target' : 'arming') + ')';
+    return 'locked on ' + who;
   }
   function refreshPanelStatus() {
     if (!panel || !cfg.ui.open) return;
@@ -2848,9 +2894,9 @@
     if (!e.isTrusted) return;
     if (e.button === 0) { S.mouseL = false; ctl.suspended = false; }
   }, true);
-  window.addEventListener('blur', () => { S.mouseL = false; S.spaceDown = false; S.holdDown = false; ctl.suspended = false; });
+  window.addEventListener('blur', () => { if (binding) { binding = null; refreshAll(); } S.mouseL = false; S.spaceDown = false; S.holdDown = false; ctl.suspended = false; });
 
-  const isTyping = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+  const isTyping = (t) => t && (t.tagName === 'TEXTAREA' || t.isContentEditable || (t.tagName === 'INPUT' && !/^(checkbox|radio|range|button|submit|reset|file|color|image)$/i.test(t.type || 'text')));
   window.addEventListener('keydown', (e) => {
     if (!e.isTrusted) return;
     if (binding) {
@@ -2862,7 +2908,7 @@
     if (isTyping(e.target)) return;
     if (e.code === 'Space') S.spaceDown = true;
     if (e.code === cfg.holdKey) S.holdDown = true;
-    if (e.code === 'KeyE' && !e.repeat) { F.belief = !F.belief; F.lastPress = nowMs(); } // the player's own E press
+    if (e.code === 'KeyE' && !e.repeat) { F.belief = !F.belief; F.lastPress = nowMs(); F.mine = false; } // the player's own E press
     if (e.ctrlKey || e.altKey || e.metaKey || e.repeat) return;
     for (const [action, code] of Object.entries(cfg.keys)) {
       if (code && e.code === code) { e.preventDefault(); e.stopImmediatePropagation(); ACTIONS[action](); return; }

@@ -1,6 +1,6 @@
 // Checks for the target-priority, parsing, human-motion and QoL features (see features.mjs for the basics).
 //
-//   DIEP_SCRIPT=work/next.user.js node test/features2.mjs
+//   DIEP_SCRIPT=diep-assist.user.js node test/features2.mjs
 import { chromium } from 'playwright';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -54,6 +54,8 @@ const target = (page) => page.evaluate(() => (diepAssist.S.sol ? diepAssist.S.so
   check('reads health bars (only damaged tanks have one)', Math.abs(m.tanks.Tester.hp - 0.55) < 0.06 && Math.abs(m.tanks['Bot-1900'].hp - 0.3) < 0.06 && m.tanks['Bot-300'].hp === null, JSON.stringify(m.tanks));
   check('sees who is shooting at me', m.tanks.Tester.shots >= 2 && m.tanks['Bot-300'].shots === 0, JSON.stringify(m.tanks));
   check('no page errors', errors.length === 0, errors.join('|'));
+  const le = await page.evaluate(() => diepAssist.S.lastError);
+  check('the script reported no internal errors', !le, le);
   await ctx.close();
 }
 

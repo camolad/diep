@@ -3,7 +3,7 @@
 //
 //   node test/replay.mjs                                   # the fixtures in test/fixtures
 //   node test/replay.mjs path/to/diep-frames-123.json      # a recording made with "Record 2 frames to a file" (or a legacy probe)
-//   DIEP_SCRIPT=work/next.user.js node test/replay.mjs
+//   DIEP_SCRIPT=diep-assist.user.js node test/replay.mjs
 //
 // Two recording formats are understood:
 //   diep-assist-frames/1   made by the script itself: every call with its canvas index and the changed context state
@@ -62,6 +62,7 @@ function replayInPage(rec) {
     }
     return v;
   };
+  const TF_CALLS = new Set(['translate', 'rotate', 'scale', 'transform', 'setTransform', 'resetTransform']);
   const rounds = { fs: 'fillStyle', ss: 'strokeStyle', lw: 'lineWidth', lc: 'lineCap', lj: 'lineJoin', ga: 'globalAlpha', ft: 'font', ta: 'textAlign' };
   let n = 0, errors = [], lastMainClear = -1;
   const cvIsMain = (i) => rec.canvases[i].main;
@@ -71,7 +72,8 @@ function replayInPage(rec) {
       if (r.d) {
         for (const k of Object.keys(r.d)) {
           let v = r.d[k];
-          if (k === 'tf') { ctx.setTransform(v[0], v[1], v[2], v[3], v[4], v[5]); continue; }
+          // the recorder stores the state AFTER the call: for a call that itself changes the transform, applying it first would apply it twice
+          if (k === 'tf') { if (!rec.legacy && TF_CALLS.has(r.m)) continue; ctx.setTransform(v[0], v[1], v[2], v[3], v[4], v[5]); continue; }
           if (v && typeof v === 'object') v = pats[v.pat];
           else if (typeof v === 'string' && v.startsWith('[object')) continue;
           if (k === 'fs' && typeof v === 'string' && v.startsWith('[object')) continue;
